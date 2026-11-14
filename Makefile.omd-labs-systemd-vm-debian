@@ -1,0 +1,3 @@
+DISTRO=debian
+
+include Makefile.common

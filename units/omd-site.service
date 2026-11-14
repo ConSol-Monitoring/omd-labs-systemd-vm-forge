@@ -1,0 +1,48 @@
+# omd-site.service - start/stop the SINGLE ACTIVE OMD site (research.md D8,
+# T006 final unit definition - T018 later replaces only the wrapper BODIES;
+# this unit file stays unchanged).
+#
+# - Type=oneshot + RemainAfterExit=yes: the site keeps running after the
+#   start job "succeeds"; `systemctl is-active omd-site` is the site's
+#   state signal the ready gate inspects (per-unit ActiveState, D3).
+# - TimeoutStartSec=90s (B2): a stuck `omd start` job FAILS
+#   (result=timeout-start) after 90 s instead of hanging; because the
+#   gate is After=-only (no Requires=/Wants=), a failed omd-site still
+#   unblocks the gate's job, which then runs and exits 1 (D3 layer ii).
+# - EnvironmentFile=-/run/omd-labs.env (D9 primary channel) +
+#   PassEnvironment= defense-in-depth for the same keys; units never rely
+#   on Environment=FOO=$FOO expansion (it performs none at all).
+#   The T006 stubs do not read the env yet - T018's guarded wrappers do.
+# - NO [Unit] FailureAction: a site failure AFTER the ready gate passed
+#   never exits the container (FR-019 second half) - the operator inspects
+#   and `systemctl restart`s. The only container-fatal unit is omd-ready.
+# - ENABLED ALWAYS (N1): the no-site path keeps it enabled - its start
+#   AND stop wrappers no-op (SITE_ACTIVE=0). The entry does NOT disable
+#   it offline; the ready gate sees a succeeded no-op unit.
+# - Modeled on OMD's reference share/omd/omd.service (plan.md item 3).
+#   Alias=omd.service (supersedes the D8 mask - debate/100-103,
+#   2026-11-13): the OMD package's generic ALL-SITES unit is NOT masked
+#   any more; `systemctl enable omd-site.service` creates the /etc alias
+#   symlink omd.service -> omd-site.service, so `systemctl status omd`
+#   reflects the single active site (the familiar OMD-VM surface). The
+#   vendor unit file stays untouched (package-owned, shadowed by the
+#   alias at load time). NOTE: the Alias= is inert until ENABLED - an
+#   unactivated Alias= resolves to nothing (debate/101 F3); the Dockerfile
+#   asserts the alias symlink at build time. `journalctl -u omd` yields no
+#   entries - filter on omd-site (debate/102 E5).
+[Unit]
+Description=OMD labs single active site (start/stop)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=90s
+EnvironmentFile=-/run/omd-labs.env
+PassEnvironment=SITE_ACTIVE SITE_NAME SITE_CUSTOM_APPLIED
+ExecStart=/usr/local/bin/omd-site-start
+ExecStop=/usr/local/bin/omd-site-stop
+
+[Install]
+WantedBy=multi-user.target
+Alias=omd.service

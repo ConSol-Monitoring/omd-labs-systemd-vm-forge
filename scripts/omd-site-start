@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# omd-site-start - start the single active OMD site (research.md D8, T018).
+#
+# Guarded wrapper (the unit file units/omd-site.service is UNCHANGED from
+# T006): reads /run/omd-labs.env (D9 primary channel); SITE_ACTIVE=0 or an
+# empty SITE_NAME => exit 0 no-op (the no-site path, N1 - never expands to
+# an empty `omd start` name); else `exec /usr/bin/omd start ${SITE_NAME}`
+# WITHOUT a leading dash - a start failure MUST be catchable by the ready
+# gate (per-unit ActiveState/Result=failed, D3 layer ii).
+set -euo pipefail
+
+SITE_ACTIVE=0 SITE_NAME=""
+if [ -r /run/omd-labs.env ]; then
+    set -a; . /run/omd-labs.env; set +a
+fi
+
+if [ "$SITE_ACTIVE" != "1" ] || [ -z "$SITE_NAME" ]; then
+    # no-site path (N1): nothing to start - a silent, fast no-op
+    exit 0
+fi
+
+exec /usr/bin/omd start "${SITE_NAME}"

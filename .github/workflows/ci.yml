@@ -1,0 +1,88 @@
+# Test build: every push to master / latest / v* (and every pull request)
+# builds both distros on both architectures to verify that the OMD package
+# and this repository still compile into a working image. NOTHING is
+# published by this workflow - publishing happens via the OMD build
+# pipeline webhook (.github/workflows/publish.yml) and tag pushes
+# (.github/workflows/release.yml).
+name: Test build (push)
+
+on:
+  push:
+    branches:
+      - master
+      - latest
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      omd_version:
+        description: 'OMD package version to build against: master (daily/testing), latest (stable), or e.g. 5.81 (versioned stable)'
+        type: string
+        required: false
+        default: master
+      debug_enabled:
+        type: boolean
+        description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
+        required: false
+        default: false
+
+env:
+  EVENT: ${{ github.event_name }}
+  INPUT_OMD: ${{ inputs.omd_version }}
+  BRANCH: ${{ github.ref_name }}
+
+jobs:
+  docker_build:
+    runs-on: ${{ matrix.target.runs }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - rocky
+          - debian
+        target:
+          - runs: ubuntu-24.04
+            platform: amd64
+          - runs: ubuntu-24.04-arm
+            platform: arm64
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v7
+
+      # branch -> OMD package version (install_omd.sh mapping):
+      # master -> master (daily/testing), latest -> latest (stable),
+      # v5.81  -> 5.81 (versioned stable)
+      - name: Resolve OMD version
+        id: resolve
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$INPUT_OMD" ]; then
+            omd="$INPUT_OMD"
+          else
+            case "$BRANCH" in
+              latest) omd=latest;;
+              v*)     omd=${BRANCH#v};;
+              *)      omd=master;;
+            esac
+          fi
+          echo "omd=$omd" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Test build::building against OMD package version $omd (this workflow does not publish)"
+
+      - name: Setup tmate session, see https://github.com/marketplace/actions/debugging-with-tmate
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+
+      # test build only: no registry login, no push
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
+        with:
+          push: false
+          file: Dockerfile.omd-labs-systemd-vm-${{ matrix.os }}
+          sbom: false
+          provenance: false
+          build-args: |
+            OMD_VERSION=${{ steps.resolve.outputs.omd }}
+            INSTALL_COMMON_RETRIES=3
+            BUILDKIT_MULTI_PLATFORM=0
+          platforms: linux/${{ matrix.target.platform }}

@@ -1,0 +1,14 @@
+#!/bin/bash
+# This hook
+# - exposes the SOURCE_BRANCH as OMD_VERSION to the build process
+# - uses $DOCKER_REPO to access the OS Dockerfile
+# https://docs.docker.com/docker-cloud/builds/advanced/
+
+env | sort
+
+# full path on Dockerhub
+# index.docker.io/consol/omd-labs-rocky  (segment 3 keeps the 'omd-labs-' prefix)
+# the Dockerfile in this repo is Dockerfile.omd-labs-systemd-vm-<distro> -
+# strip the 'omd-labs-' prefix before composing the file name.
+DOCKERFILE=Dockerfile.omd-labs-systemd-vm-$(echo $DOCKER_REPO | cut -d "/" -f 3 | sed 's/^omd-labs-//')
+docker build -f $DOCKERFILE -t $IMAGE_NAME --build-arg OMD_VERSION=$(echo ${SOURCE_BRANCH} | sed 's/v//') $@ .

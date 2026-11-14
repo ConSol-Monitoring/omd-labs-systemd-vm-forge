@@ -1,0 +1,1113 @@
+#!/usr/bin/env bash
+# omd-labs-entry - the container entry (research.md D1, D6, D9, C5, C6, C7,
+# C11; D3 layer i).
+#
+# CMD ["/usr/local/bin/omd-labs-entry"]. Pre-init bootstrap that runs
+# BEFORE systemd exists:
+#   - resolves SITENAME (runtime; absent and empty are treated IDENTICALLY
+#     => SITE_ACTIVE=0, no site - FR-006/FR-007 edge case; the entry never
+#     reads OMD_SITE as input - FR-008);
+#   - validates a non-empty name against the OMD rule (C6; FR-007 fast
+#     fail - before systemd exists, nothing is started);
+#   - reconciles the mount at /omd/sites/$SITE_NAME per the D6 state matrix
+#     (absent/empty => create; persisted => resume; interrupted-init =>
+#     recovery; legacy complete => adopt; legacy incomplete => failure;
+#     not-writable => failure) - every long-running child under a bounded
+#     `timeout` capped by the REMAINING bootstrap budget (D3 layer i, N2:
+#     the whole bootstrap cannot exceed 120 s from the t=0 epoch under any
+#     interleaving);
+#   - applies the effective customization on (re)creation paths only
+#     (T026 hook - D4), with the single init-complete commit point after
+#     customization succeeded;
+#   - the SSH credential file (D7 - T024 hook);
+#   - writes /run/omd-labs.env (D9), spawns the orphaned log forwarder (C5),
+#     then exec /sbin/init (FR-001 - init owns the lifetime).
+#
+# Every failure before exec /sbin/init is a natural non-zero container exit
+# (FR-019 phase 1 - deterministic, no systemd exit machinery involved).
+set -euo pipefail
+
+# T0 = the entry's start epoch: rem_budget() measures the REMAINING
+# bootstrap budget (BOOTSTRAP_BUDGET - elapsed) from this instant.
+# (Must be captured here - a placeholder 0 would make rem_budget subtract
+# 0 from the epoch and report the budget exhausted immediately.)
+T0=$(date +%s)
+BOOTSTRAP_BUDGET=120   # D3 layer i / D1 step 8: end-to-end pre-init bound
+
+SITE_ACTIVE=0
+SITE_NAME=""
+SITE_STATE=""          # created-fresh | persisted | recovered | adopted | none
+SITE_CUSTOM_APPLIED=0  # D9: 1 when the T026 customization was applied (row 1/3a)
+SITE_CUSTOM_SUMMARY="" # D9: the effective-customization summary line (FR-010)
+
+# ---- bounded children (D3 layer i, N2) --------------------------------------
+# rem_budget: the REMAINING overall bootstrap budget (120 s - elapsed).
+rem_budget() {
+    local el=$(( $(date +%s) - T0 ))
+    local rem=$(( BOOTSTRAP_BUDGET - el ))
+    [ "$rem" -lt 0 ] && rem=0
+    echo "$rem"
+}
+# run_bounded <seconds-own-cap> <description> <cmd...>:
+# runs the child under `timeout min(cap, remaining budget)` WITH KILL
+# escalation (-k 1: TERM at the deadline, SIGKILL of the child's process
+# group 1 s later) and FILE capture (not a command-substitution pipe).
+# (M2, codex 99) both protections mirror cfg_timeout and were missing here:
+#   - no -k: a TERM-ignoring child (e.g. an `omd create` subprocess that
+#     traps TERM) outlives the deadline and the `timeout` process itself
+#     (EMPIRICAL, cfg_timeout's empirical note) - the bootstrap would block
+#     until the child exits on its own, unbounded;
+#   - pipe capture: `out=$(timeout ...)` waits for the pipe to close, and a
+#     surviving descendant that inherited the write end keeps it open
+#     (indefinitely in the pathological case) - the file capture removes the
+#     pipe entirely.
+# A breach is a bounded, fatal start failure BEFORE systemd exists (rc 1).
+# The -k grace adds at most 1 s past the deadline; the budget exhaustion
+# fatals (rem_budget <= 0) gate the entry, so the total bootstrap overshoot
+# is bounded by that single 1 s (same accounting as cfg_timeout).
+run_bounded() {
+    local cap=$1 desc=$2; shift 2
+    local rem t out rc tfile
+    rem=$(rem_budget)
+    t=$cap
+    [ "$rem" -lt "$t" ] && t=$rem
+    if [ "$t" -le 0 ]; then
+        fatal "FATAL: bootstrap budget (${BOOTSTRAP_BUDGET}s) exhausted before step: ${desc}"
+    fi
+    echo "omd-labs-entry: step: ${desc} (bounded: ${t}s)"
+    tfile=$(mktemp /tmp/omd-stepout.XXXXXX)
+    rc=0
+    timeout -k 1 "$t" "$@" >"$tfile" 2>&1 || rc=$?
+    out=$(cat "$tfile" 2>/dev/null)
+    rm -f "$tfile" 2>/dev/null || true
+    if [ "$rc" -ne 0 ]; then
+        if [ -n "$out" ]; then
+            echo "$out" >&2
+        fi
+        if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+            echo "FATAL: step timed out after ${t}s: ${desc}" >&2
+        fi
+        fatal "FATAL: step failed (rc=${rc}): ${desc}"
+    fi
+}
+
+# fatal() - the single fatal exit path (pre-init): record the reason in the
+# deterministic file /var/log/omd-labs/entry-fatal (overlay-backed - readable
+# after the container stops via `podman cp`, even when the log driver has not
+# captured the fast-exit stderr [EMPIRICAL 2026-11-10: journald driver loses
+# the stderr of containers that exit < 1 s]), print it to stderr, exit 1.
+fatal() {
+    local i
+    mkdir -p /var/log/omd-labs 2>/dev/null || true
+    {
+        for i in "$@"; do printf '%s\n' "$i"; done
+    } > /var/log/omd-labs/entry-fatal 2>/dev/null || true
+    printf '%s\n' "$@" >&2
+    exit 1
+}
+
+# ---- helpers -----------------------------------------------------------------
+# the in-image apache user (else omd create --reuse fails - D6 row 1(ii))
+APACHE_USER=apache
+[ -r /etc/os-release ] && . /etc/os-release 2>/dev/null || true
+case "${ID:-}" in debian) APACHE_USER=www-data ;; esac
+
+# next free numeric identity (deterministic scan; D6 row 1)
+alloc_identity() { # prints "uid gid"
+    local uid gid
+    # first runtime-created site takes 1000/1000 (documented); the scan below
+    # yields the next free pair when 1000 is taken.
+    for uid in $(seq 1000 1005); do
+        id -u "$uid" >/dev/null 2>&1 || break
+    done
+    for gid in $(seq 1000 1005); do
+        getent group "$gid" >/dev/null 2>&1 || break
+    done
+    if id -u "$uid" >/dev/null 2>&1 || getent group "$gid" >/dev/null 2>&1; then
+        fatal "FATAL: no free uid/gid in 1000..1005 for site ${SITE_NAME} - collision; manual identity assignment required"
+    fi
+    echo "$uid $gid"
+}
+
+# NOTE: assigned in main AFTER site_resolve (the site path depends on the
+# resolved name). The empty defaults below are never used: every consumer
+# (site_mount, create_site, adopt_site, rollback, infer_legacy_identity,
+# recover_interrupted) runs only on the SITE_ACTIVE=1 path.
+SITE_DIR=""
+INPROG=""
+COMPLETE=""
+IDENTITY=""
+
+# rollback ledger (T016): the bootstrap's OWN created artifacts - never a
+# pre-existing/populated mount, never omd rm (UNVERIFIED semantics - T6).
+# (M1, codex 99) per-artifact flags set only after each successful creation -
+# a rollback deletes only what THIS boot created, never a pre-existing account.
+ROLLBACK_CREATED_GROUP=0
+ROLLBACK_CREATED_USER=0
+rollback() {
+    echo "omd-labs-entry: rolling back bootstrap-created artifacts (no pre-existing data touched)"
+    # remove the tmpfs fstab line we added (marker: the site-specific
+    # uid=<site>, option - matches both the /omd and the canonical
+    # /opt/omd path form OMD accepts, fstab_verify omd.py)
+    if grep -q "uid=${SITE_NAME}," /etc/fstab 2>/dev/null; then
+        sed -i "\#uid=${SITE_NAME},#d" /etc/fstab 2>/dev/null || true
+    fi
+    # remove the site registration files omd create/enable wrote
+    for f in /omd/apache/${SITE_NAME}.conf /omd/apache/${SITE_NAME}.conf.include /omd/apache/maint_${SITE_NAME}; do
+        [ -e "$f" ] && rm -f "$f" 2>/dev/null || true
+    done
+    # remove the account we created - ONLY if we created it (per-artifact
+    # ledger, M1 codex 99). A pre-existing same-name account/group (e.g. a
+    # base account like apache) is NEVER deleted: the create-path collision
+    # pre-check now refuses such names before any mutation, so these flags
+    # are set only when this boot made the account.
+    if [ "$ROLLBACK_CREATED_USER" = "1" ] && grep -q "^${SITE_NAME}:" /etc/passwd 2>/dev/null; then
+        userdel "${SITE_NAME}" 2>/dev/null || true
+    fi
+    if [ "$ROLLBACK_CREATED_GROUP" = "1" ] && getent group "${SITE_NAME}" >/dev/null 2>&1; then
+        groupdel "${SITE_NAME}" 2>/dev/null || true
+    fi
+    # (T027, codex 81 BLOCKER) RETAIN the in-progress marker AND the
+    # identity file on a failed first creation - they are the durable
+    # PROVENANCE that a first creation was interrupted (FR-009 / US3
+    # scenario 6). The retry must classify row 3a RECOVERY
+    # (recover_interrupted: idempotent completion + re-apply of the
+    # CORRECTED customization + the completion-marker commit), NOT row 3b
+    # ADOPT (which would start the partially-configured site as if it were
+    # complete, ignore the corrected input, and then write the
+    # init-complete marker - silently committing the partial state).
+    # (The pre-T027 behavior deleted both here per codex 75 B3's rationale
+    # "else the retry would be misclassified ADOPT" - that rationale was
+    # WRONG: ADOPT is exactly the forbidden outcome; codex 81 corrects the
+    # history: preserving failed-initialization provenance is essential.)
+    # The marker file only ever exists when WE wrote it (row 1 only); the
+    # resume path's stale-marker removal (:211) is unaffected (a persisted
+    # volume + a stray in-progress marker is still cleaned after
+    # validation, as before).
+}
+
+# the OMD invariants for a completed tree (C7 user_verify, omd.py:480-508 -
+# the row 3b/3c classification): non-root numeric owner, version symlink,
+# etc/omd/site.conf present.
+# (M3, codex 99) the version link must EXIST as a symlink, not RESOLVE: a
+# site created by an OLDER image carries a version link whose target
+# (/omd/versions/<old>) is absent from the NEW image - that site is in OMD's
+# "needs to be updated" state (EMPIRICAL: omd status => "This site needs to be
+# updated with: omd update"), NOT an incomplete tree. The cross-version case
+# is classified COMPLETE (migratable via omd update in restore_registration);
+# only a genuinely ABSENT version link is a row-3c missing part.
+odm_tree_complete() { # odm_tree_complete <dir>
+    local d=$1 owner
+    [ -d "$d/etc/omd" ] || return 1
+    [ -f "$d/etc/omd/site.conf" ] || return 1
+    [ -L "$d/version" ] || return 1
+    owner=$(stat -c %u "$d")
+    [ "$owner" != "0" ] || return 1
+    case "$owner" in *[!0-9]*|'') return 1;; esac
+    return 0
+}
+
+# ---- (T015) the site path: validate the name (C6, FR-007) --------------------
+site_resolve() {
+    # the OMD rule (omd.py:3096 - EMPIRICAL): 1-16 chars, letter/underscore
+    # first, then letters/digits/underscore. The pre-check is the fast path;
+    # `omd create` remains the final arbiter.
+    # (M4, codex 99) match the ENTIRE scalar with Bash's anchored regex, NOT a
+    # line-oriented `echo | grep`: the old form matched the (valid) first line
+    # of a multiline value like "good\nbad/name" and accepted the whole string
+    # (grep is line-oriented; Bash =~ is whole-string, so $ = end-of-string and
+    # a newline/control char cannot match the class). This stops a slash or
+    # parent segment on a later line from escaping the intended site path.
+    if [[ ! "$SITE_NAME" =~ ^[a-zA-Z_][a-zA-Z_0-9]{0,15}$ ]]; then
+        fatal "FATAL: invalid SITENAME '${SITE_NAME}' (must match OMD rule: 1-16 chars, [a-zA-Z_] first, then [a-zA-Z_0-9]; no control characters)" "FATAL: no site was started; fix the value and re-run"
+    fi
+    SITE_ACTIVE=1
+    echo "omd-labs-entry: SITE_ACTIVE=1 SITE_NAME=${SITE_NAME} (validated)"
+}
+
+# ---- (T016) the D6 mount state machine ----------------------------------------
+site_mount() {
+    # row 4 - not writable => exit 1 naming the location (FR-009)
+    if [ ! -d "$SITE_DIR" ]; then
+        if ! mkdir -p "$SITE_DIR" 2>/dev/null; then
+            fatal "FATAL: cannot create ${SITE_DIR} - the site path is not writable"
+        fi
+    else
+        if [ ! -w "$SITE_DIR" ] || [ ! -w "$(dirname "$SITE_DIR")" ]; then
+            fatal "FATAL: ${SITE_DIR} is not writable (run the container with a writable volume at /omd/sites/${SITE_NAME})"
+        fi
+    fi
+
+    if [ -f "$COMPLETE" ]; then
+        # row 2 - persisted: resume. Never reset, never re-create, never
+        # re-customize. (F2, codex 61: the stale in-progress marker is
+        # removed ONLY after validation passed - restore_registration's
+        # occupied-uid/gid fatals AND the settings validation below must
+        # not have mutated the volume.)
+        SITE_STATE=persisted
+        # settings validated FIRST (fail-fast, no mutation): an invalid
+        # line is a fast start failure on every path that reads inputs
+        site_effective_settings
+        restore_registration
+        if [ -f "$INPROG" ]; then
+            echo "omd-labs-entry: stale in-progress marker on a persisted site - removing (resume path, validated)"
+            rm -f "$INPROG"
+        fi
+        # FR-012: a persisted site keeps its STORED configuration - supplied
+        # inputs are NOT applied (the deterministic notice; main-shell
+        # resolution, see adopt_site)
+        if [ -n "$EFF_SETTINGS" ]; then
+            # FR-012 deterministic notice (lowercase "not applied" - the
+            # contract string the verification suite asserts case-sensitively)
+            echo "omd-labs-entry: NOTICE - customization inputs were supplied but not applied: site ${SITE_NAME} is a persisted volume - its stored configuration is authoritative (FR-012)"
+        fi
+        echo "omd-labs-entry: resumed existing site ${SITE_NAME}"
+        return 0
+    fi
+
+    if [ -f "$INPROG" ]; then
+        # row 3a - interrupted first creation: T017 recovery
+        SITE_STATE=recovering
+        recover_interrupted
+        return 0
+    fi
+
+    local nfiles
+    nfiles=$(ls -A "$SITE_DIR" 2>/dev/null | wc -l)
+    if [ "$nfiles" -eq 0 ]; then
+        # row 1 - absent/empty: CREATE
+        SITE_STATE=created-fresh
+        create_site
+        return 0
+    fi
+
+    # populated, NO markers: legacy/pre-marker volume - classify (3b/3c)
+    if odm_tree_complete "$SITE_DIR"; then
+        # row 3b - ADOPT a legacy/pre-marker site
+        SITE_STATE=adopted
+        adopt_site
+        return 0
+    fi
+
+    # row 3c - incomplete tree: actionable failure, never adopted/started
+    local missing=""
+    [ -f "${SITE_DIR}/etc/omd/site.conf" ] || missing="${missing} etc/omd/site.conf"
+    [ -e "${SITE_DIR}/version" ] || missing="${missing} version(symlink)"
+    [ -d "${SITE_DIR}/etc/omd" ] || missing="${missing} etc/omd/"
+    fatal "FATAL: ${SITE_DIR} is populated but NOT a complete OMD site (missing:${missing})." "FATAL: refusing to adopt/start an incomplete site - remedy: remove the partial data and re-run, or supply a complete site volume."
+}
+
+# the D6 row-1 pre-steps (C7: plain omd create refuses on ANY existing tree;
+# --reuse only needs the version symlink absent + the user_verify invariants)
+create_site() {
+    echo "omd-labs-entry: creating site ${SITE_NAME} (row 1)"
+    # (T026, codex 75 B3) the effective settings are parsed+validated BEFORE
+    # the FIRST mutation (the touch "$INPROG" below): an invalid settings
+    # line must fail the start with NOTHING written - the resume/adopt/
+    # recovery paths do exactly this (settings-first), and the fresh path
+    # must hold the same no-mutation guarantee (the identity file + the
+    # in-progress marker would otherwise be written before the settings
+    # fatal). The apply itself (site_customize) happens AFTER creation -
+    # `omd config set` needs the created site (omd.py needs_site=1,
+    # must_exist=True) - only the VALIDATION is hoisted pre-mutation. The
+    # parse result is reused by site_customize (re-parsed in its main-shell
+    # context; the input is static for the boot unless the operator swaps
+    # the bind mount mid-boot, which is out of contract).
+    site_effective_settings
+    trap 'rc=$?; [ "$rc" -ne 0 ] && rollback; exit "$rc"' EXIT
+    # (M1, codex 99) collision pre-check BEFORE any mutation: if a user OR a
+    # group named SITE_NAME already exists, `groupadd`/`useradd` below would
+    # fail mid-way and the EXIT-trap rollback would then try to delete the
+    # PRE-EXISTING account (it cannot tell ours from a base account such as
+    # apache - EMPIRICAL mock: rollback deleted "apache"). Refuse instead.
+    # Row 1 is an absent/empty mount, so a same-name account here is a base
+    # account or a leftover - never ours. This also makes the rollback ledger
+    # below accurate (we are the only creator of a same-name account).
+    if id "${SITE_NAME}" >/dev/null 2>&1; then
+        fatal "FATAL: a user named '${SITE_NAME}' already exists (uid $(id -u "${SITE_NAME}")) - the site name collides with an existing account; refusing (no mutation). Remedy: choose a different SITENAME or remove the account."
+    fi
+    if getent group "${SITE_NAME}" >/dev/null 2>&1; then
+        fatal "FATAL: a group named '${SITE_NAME}' already exists (gid $(getent group "${SITE_NAME}" | cut -d: -f3)) - the site name collides with an existing group; refusing (no mutation). Remedy: choose a different SITENAME or remove the group."
+    fi
+    # (i) deterministic identity allocation. Per-artifact rollback ledger
+    # (M1, codex 99): each flag is set ONLY after its own creation succeeds,
+    # so a rollback never claims to have created - and never deletes - an
+    # artifact that pre-existed or was not created.
+    local ident uid gid
+    ROLLBACK_CREATED_GROUP=0 ROLLBACK_CREATED_USER=0
+    # the in-progress marker BEFORE any mutation work (D1 step 5):
+    # the very first mutation below (groupadd) is already recorded
+    touch "$INPROG"
+    ident=$(alloc_identity)
+    uid=${ident% *}; gid=${ident#* }
+    groupadd -g "$gid" "${SITE_NAME}" && ROLLBACK_CREATED_GROUP=1
+    useradd -u "$uid" -g "${SITE_NAME}" -G omd -d "${SITE_DIR}" -s /bin/bash "${SITE_NAME}" && ROLLBACK_CREATED_USER=1
+    # the identity file - written as soon as the account exists (D6 row 1)
+    printf 'uid=%s gid=%s\n' "$uid" "$gid" > "$IDENTITY"
+    chown "${SITE_NAME}:${SITE_NAME}" "$IDENTITY"
+
+    # (ii) the apache group membership (omd create --reuse needs it)
+    usermod -aG "${SITE_NAME}" "$APACHE_USER"
+
+    # (iii) the tmpfs fstab line - the OMD-canonical form (omd.py
+    # add_to_fstab): REALPATH mount point (/omd is a symlink to /opt/omd)
+    # and the uid/gid options; the presence check matches the site-specific
+    # uid=<site>, so any correct form (legacy /omd path or canonical
+    # /opt/omd path) satisfies fstab_verify
+    if ! grep -q "uid=${SITE_NAME}," /etc/fstab 2>/dev/null; then
+        echo "tmpfs  /opt/omd/sites/${SITE_NAME}/tmp tmpfs noauto,user,mode=755,uid=${SITE_NAME},gid=${SITE_NAME} 0 0" >> /etc/fstab
+    fi
+
+    # (iv) home dir ownership - group = omd group (NOT the site's primary
+    # group - omd.py:3281/3353; the primary gid is recorded, not re-read)
+    chown "${SITE_NAME}:omd" "$SITE_DIR"
+
+    
+    # (v) omd create --reuse (~3.5 s non-interactive - C7; the "restart
+    # apache" step is a harmless no-op warning pre-init)
+    run_bounded 90 "omd create --reuse ${SITE_NAME}" omd create --reuse "${SITE_NAME}"
+
+    # (T026) customization - the site IS being created (D4 scope)
+    site_customize
+
+    # the single init-complete commit point (after create + customization):
+    # complete marker, then remove the in-progress marker
+    touch "$COMPLETE"
+    chown "${SITE_NAME}:omd" "$COMPLETE" 2>/dev/null || true
+    rm -f "$INPROG"
+    echo "omd-labs-entry: created new site ${SITE_NAME}"
+    SITE_STATE=created-fresh
+}
+
+# (T026, codex 75 B1/B4) identity validation - the SINGLE gate every path
+# must pass BEFORE any write/mutation (the F2 no-mutation guarantee).
+# The volume-RECORDED identity (or the computed inference) is data: a
+# malformed/corrupt/malicious file must fail the start, never poison the
+# account tools (useradd -u '' -u 0 are rejected by shadow-utils, but only
+# AFTER this function's writes have happened - so the check comes FIRST).
+# Accepts exactly one line "uid=<digits> gid=<digits>" (the writers'
+# printf format); the file is optional (absence = inference).
+# rc 0: VALID_UID/VALID_GID set. rc 1: fatal already raised.
+validate_identity() { # validate_identity <uid> <gid>
+    local uid=$1 gid=$2
+    case "$uid" in ''|*[!0-9]*)
+        fatal "FATAL: malformed recorded identity (uid='${uid}') for site ${SITE_NAME} - the value must be a non-empty integer. No mutation. Remedy: fix or remove .omd-labs-site-identity."
+        ;;
+    esac
+    case "$gid" in ''|*[!0-9]*)
+        fatal "FATAL: malformed recorded identity (gid='${gid}') for site ${SITE_NAME} - the value must be a non-empty integer. No mutation. Remedy: fix or remove .omd-labs-site-identity."
+        ;;
+    esac
+    # (M5, codex 99) range-check WITHOUT fixed-width arithmetic: the old
+    # `$((10#$uid))` silently wrapped an oversized digit string (bash uses
+    # unsigned 64-bit; 18446744073709552616 wraps to 1000 and passed), so an
+    # oversized value was "validated" and the original string was later written
+    # to the identity file, defeating the no-mutation handling. 60000 has five
+    # digits: any all-digit string LONGER than 5 is > 60000 by length alone, and
+    # a <=5-digit string is safe to evaluate (max 99999, no overflow).
+    if [ "${#uid}" -gt 5 ] || [ "$((10#$uid))" -gt 60000 ]; then
+        fatal "FATAL: recorded uid ${uid} is out of range (<=60000) for site ${SITE_NAME} - refusing (no mutation). Remedy: fix .omd-labs-site-identity."
+    fi
+    if [ "${#gid}" -gt 5 ] || [ "$((10#$gid))" -gt 60000 ]; then
+        fatal "FATAL: recorded gid ${gid} is out of range (<=60000) for site ${SITE_NAME} - refusing (no mutation). Remedy: fix .omd-labs-site-identity."
+    fi
+    VALID_UID=$uid VALID_GID=$gid
+    return 0
+}
+
+# (M3, codex 99) cross-version migration - the supported recreate-as-upgrade
+# workflow (spec: "recreating the container with the new image on the same
+# persisted volume is the supported upgrade path"). A site whose version link
+# resolves to a version ABSENT from the new image is in OMD's "needs to be
+# updated" state; omd enable/start would fail on it. OMD's own non-interactive
+# cross-version flow is `omd update <site>` (EMPIRICAL 2026-11-11: `yes |`
+# piped input, root, rc 0, "Finished update" - it re-targets the version link
+# to the image's version, MERGES the new skel over the stored files with
+# fallback to the stored values when the old skel is absent, and PRESERVES
+# site.conf, credentials and all site data). run_bounded keeps it inside the
+# bootstrap budget; a failure is a fatal start failure (never a silent data
+# loss, never a re-label to "incomplete" recommending deletion).
+migrate_site_version() { # migrate_site_version - no-op unless the version is foreign
+    local ver
+    ver=$(readlink -f "${SITE_DIR}/version" 2>/dev/null || true)
+    [ -n "$ver" ] && [ -d "$ver" ] && return 0   # resolves to an installed version
+    if [ -L "${SITE_DIR}/version" ]; then
+        local old
+        old=$(readlink "${SITE_DIR}/version" || true)
+        echo "omd-labs-entry: site version ${old:-<broken>} is not installed in this image - migrating via omd update (recreate-as-upgrade workflow)"
+        # `yes |` answers the update's confirmation; the omd wrapper needs
+        # the site context - run as the site user? NO: omd update is a
+        # root command (EMPIRICAL: the site-user form refused with "root
+        # permissions are needed"). Run as root, bounded.
+        if ! run_bounded 90 "omd update ${SITE_NAME}" sh -c "yes | omd update ${SITE_NAME}"; then
+            fatal "FATAL: cross-version migration failed: omd update ${SITE_NAME} did not complete within the budget - the site's version link (target absent from this image) could not be migrated. No data was destroyed; re-run or run 'omd update ${SITE_NAME}' manually inside the container."
+        fi
+        # the migration re-targets the link; a still-dangling link is a
+        # failure (the update reported rc 0 but did not link the version)
+        ver=$(readlink -f "${SITE_DIR}/version" 2>/dev/null || true)
+        [ -n "$ver" ] && [ -d "$ver" ] || fatal "FATAL: cross-version migration incomplete: the version link of ${SITE_NAME} still does not resolve to an installed version after omd update - manual fix required (no data was destroyed)."
+        echo "omd-labs-entry: site ${SITE_NAME} migrated to the installed OMD version ($(basename "$ver"))"
+    fi
+}
+
+# the D6 row-2 registration restore (C8): the site account is absent in the
+# fresh image - restore it from the recorded identity (or infer it for a
+# legacy volume), then omd enable (re-registers the apache include).
+restore_registration() {
+    # (T026, codex 75 B2) an EXISTING same-name account is NOT trusted
+    # blindly: its UID / primary GID / home must MATCH the volume identity
+    # (the recorded file, or the inference for a legacy volume). A mismatch
+    # is a fatal, no mutation - the alternative (proceeding into chown/
+    # start with a foreign account) would silently rebind the volume's data
+    # to the wrong numerics. The inference is computed-only here.
+    if id "${SITE_NAME}" >/dev/null 2>&1; then
+        local uid gid
+        if [ -f "$IDENTITY" ]; then
+            uid=$(sed -n 's/uid=\([^ ]*\).*/\1/p' "$IDENTITY")
+            gid=$(sed -n 's/.* gid=\([^ ]*\).*/\1/p' "$IDENTITY")
+        else
+            infer_legacy_identity
+            uid=${uid_var:-}; gid=${gid_var:-}
+        fi
+        validate_identity "$uid" "$gid"
+        local auid agid ahome
+        auid=$(id -u "${SITE_NAME}"); agid=$(id -g "${SITE_NAME}")
+        ahome=$(getent passwd "${SITE_NAME}" | cut -d: -f6)
+        [ "$auid" = "$uid" ] || fatal "FATAL: existing account ${SITE_NAME} has uid ${auid}, the volume identity records uid ${uid} - mismatch, refusing (no mutation). Remedy: userdel the account or restore the original volume."
+        [ "$agid" = "$gid" ] || fatal "FATAL: existing account ${SITE_NAME} has primary gid ${agid}, the volume identity records gid ${gid} - mismatch, refusing (no mutation). Remedy: usermod -g the account or fix .omd-labs-site-identity."
+        [ "$ahome" = "$SITE_DIR" ] || fatal "FATAL: existing account ${SITE_NAME} has home '${ahome}', the site dir is '${SITE_DIR}' - mismatch, refusing (no mutation). Remedy: usermod -d the account or restore the original volume."
+        echo "omd-labs-entry: site account ${SITE_NAME} present and matches the volume identity (uid=${uid} gid=${gid}) - skipping registration restore"
+        return 0
+    fi
+    local uid gid
+    if [ -f "$IDENTITY" ]; then
+        # the RECORDED identity is authoritative (D6 row 2); the file is a
+        # single line: "uid=<u> gid=<g>" (the writers' printf format)
+        uid=$(sed -n 's/uid=\([^ ]*\).*/\1/p' "$IDENTITY")
+        gid=$(sed -n 's/.* gid=\([^ ]*\).*/\1/p' "$IDENTITY")
+        echo "omd-labs-entry: restoring registration from recorded identity (uid=${uid} gid=${gid})"
+    else
+        # legacy volume (no identity file): infer + guard (B2)
+        # COMPUTE-ONLY (F2, codex 61): the file is recorded by this function
+        # BELOW, only after the occupied-uid/gid validation has passed - a
+        # fail-fast must not have written to the volume
+        infer_legacy_identity
+        uid=${uid_var}; gid=${gid_var}
+    fi
+    # (T026, codex 75 B1) the recorded/inferred values are DATA - validate
+    # their syntax FIRST (a malformed value must not reach the account
+    # tools or the identity-file write below)
+    validate_identity "$uid" "$gid"
+    # uid/gid occupied by a DIFFERENT account => clear fatal, no mutation
+    # (BEFORE any write/mutation - F2 ordering)
+    if getent passwd "$uid" | grep -qv "^${SITE_NAME}:" && id -u "$uid" >/dev/null 2>&1; then
+        fatal "FATAL: uid ${uid} is occupied by a different account ($(getent passwd "$uid" | cut -d: -f1)) - cannot restore site ${SITE_NAME}"
+    fi
+    if id -u "$uid" >/dev/null 2>&1; then
+        fatal "FATAL: uid ${uid} already exists (account '${SITE_NAME}' missing but numerics taken) - manual identity fix required; no mutation"
+    fi
+    # F2 (codex 61): the useradd group must EXIST BY NAME - a numeric
+    # recorded/inferred gid can carry a FOREIGN group name (or be absent).
+    # The foreign-name check is VALIDATION (fatal) and must run BEFORE any
+    # write (even the identity file) so a fail-fast leaves the volume
+    # untouched.
+    if getent group "$gid" >/dev/null 2>&1; then
+        local gname
+        gname=$(getent group "$gid" | cut -d: -f1)
+        [ "$gname" = "$SITE_NAME" ] || fatal "FATAL: gid ${gid} belongs to group '${gname}', not site '${SITE_NAME}' - refusing to bind the site account to a foreign group (no mutation). Remedy: free the gid or fix the recorded identity."
+    fi
+    # (T026, codex 75 B1) the INVERSE collision: a group NAMED after the
+    # site already exists at a DIFFERENT gid, while the requested gid is
+    # free. useradd -g <name> binds the account to the EXISTING group's
+    # gid (a silent identity change), and a naive `groupadd -g <gid>
+    # <name>` would then fail (group exists) AFTER the identity file was
+    # already written - a mutated volume with an uncaught exit code.
+    # Refuse (no mutation).
+    # NOTE: `getent group <name>` EXITS 2 when the group is ABSENT - under
+    # set -e + pipefail a bare assignment would abort the entry in the
+    # NORMAL (group-absent) case. The `|| true` makes the pipeline safe
+    # (same pattern as rollback's identity read).
+    local existing_gname
+    existing_gname=$(getent group "${SITE_NAME}" | cut -d: -f1 || true)
+    if [ -n "$existing_gname" ]; then
+        local existing_ggid
+        existing_ggid=$(getent group "${SITE_NAME}" | cut -d: -f3 || true)
+        [ "$existing_ggid" = "$gid" ] || fatal "FATAL: a group named '${SITE_NAME}' already exists at gid ${existing_ggid} (the recorded identity requests gid ${gid}) - refusing (no mutation). Remedy: groupdel/rename the existing group or fix the recorded identity."
+    fi
+    # ALL validation passed - the identity file is written now (the single
+    # write point for the inference/lost-identity case; the recorded case
+    # re-writes it with identical content, idempotent)
+    printf 'uid=%s gid=%s\n' "$uid" "$gid" > "$IDENTITY"
+    chown "$uid:$gid" "$IDENTITY" 2>/dev/null || true
+    # the group (absent - validated free above) is created with the SITE
+    # NAME at the numeric gid; the home dir's group stays the omd group
+    # (chown below), so this never clobbers the site:omd invariant
+    getent group "$gid" >/dev/null 2>&1 || groupadd -g "$gid" "${SITE_NAME}"
+    useradd -u "$uid" -g "${SITE_NAME}" -G omd -d "${SITE_DIR}" -s /bin/bash "${SITE_NAME}"
+    usermod -aG "${SITE_NAME}" "$APACHE_USER" 2>/dev/null || true
+    chown "${SITE_NAME}:omd" "$SITE_DIR"
+    # re-add the fstab line if absent (omd enable does not restore it)
+    # the OMD-canonical tmpfs line (omd.py add_to_fstab): the REALPATH mount
+    # point (/omd is a symlink to /opt/omd) and the uid/gid options - the
+    # presence check matches the site-specific uid=<site>, so any correct
+    # form (legacy /omd path or canonical /opt/omd path) satisfies it
+    if ! grep -q "uid=${SITE_NAME}," /etc/fstab 2>/dev/null; then
+        echo "tmpfs  /opt/omd/sites/${SITE_NAME}/tmp tmpfs noauto,user,mode=755,uid=${SITE_NAME},gid=${SITE_NAME} 0 0" >> /etc/fstab
+    fi
+    # (M3, codex 99) cross-version migration: a site whose version link
+    # targets a version absent from this image cannot be enabled as-is -
+    # migrate it with OMD's own flow BEFORE omd enable (site.conf, data and
+    # credentials are preserved by the update's merge; no-op when the version
+    # resolves to an installed version).
+    migrate_site_version
+    run_bounded 90 "omd enable ${SITE_NAME}" omd enable "${SITE_NAME}"
+    echo "omd-labs-entry: registration restored for ${SITE_NAME} (uid=${uid} gid=${gid})"
+}
+
+# the D6 row 2/3b legacy inference (B2): uid from the home owner, primary gid
+# from a site-owned subfolder's group; the inferred gid must NOT equal the
+# omd group's gid (the home group is always omd - ambiguous otherwise).
+# COMPUTE-ONLY (F2, codex 61): the identity file is written by the CALLERS
+# (restore_registration / recover_interrupted) AFTER all validation - a
+# fail-fast (occupied uid/gid, ambiguity) must not have mutated the volume.
+infer_legacy_identity() {
+    local uid gid
+    uid=$(stat -c %u "$SITE_DIR")
+    # the inferred primary gid comes from a site-owned subfolder's group
+    # (the home dir's own group is the omd group, never the primary)
+    gid=$(stat -c %g "${SITE_DIR}/etc" 2>/dev/null) || gid=$(stat -c %g "${SITE_DIR}/var" 2>/dev/null) || gid=""
+    if [ -z "$gid" ]; then
+        fatal "FATAL: cannot infer the site's primary gid from ${SITE_DIR} (no site-owned subfolder readable)"
+    fi
+    # the guard: the inferred primary gid must not equal the omd group's gid
+    local omdgid
+    omdgid=$(getent group omd | cut -d: -f3 || echo "")
+    if [ -n "$omdgid" ] && [ "$gid" = "$omdgid" ]; then
+        fatal "FATAL: inferred identity is AMBIGUOUS - the site subfolders' group (${gid}) equals the omd group's gid; the primary gid cannot be determined. Refusing (no mutation). Remedy: run the site once from its original image or set the identity manually."
+    fi
+    echo "omd-labs-entry: inferred legacy identity uid=${uid} gid=${gid} (from home owner + subfolder group)"
+    uid_var=$uid gid_var=$gid
+}
+
+# the D6 row 3b ADOPT (B3): the stored site.conf is authoritative - NO
+# customization applied; the init-complete marker is written DIRECTLY
+# (leaves the no-marker class).
+adopt_site() {
+    # (T026, codex 75 N3) the effective settings are parsed+validated ONCE,
+    # before ANY mutation below: restore_registration creates a group and
+    # writes the identity file, touch "$COMPLETE" commits the marker - a
+    # second parse after those writes could see a CHANGED bind-mounted
+    # input file and fatal after the commit (a volume that left the
+    # no-marker class without a valid outcome).
+    site_effective_settings
+    restore_registration
+    touch "$COMPLETE"
+    chown "${SITE_NAME}:omd" "$COMPLETE" 2>/dev/null || true
+    # contract banner (codex 64): "adoptED existing site" - the SUCCESS
+    # banner is logged AFTER the validation/registration it reports on
+    # (codex 75 N3: a banner before its own validation is not a success
+    # banner)
+    echo "omd-labs-entry: adopted existing site ${SITE_NAME} (no init marker - legacy/pre-marker volume)"
+    # FR-012: if customization inputs were supplied, they are NOT applied
+    # to an adopted site - the deterministic notice, from the PRE-MUTATION
+    # parse above. (Resolved in the MAIN shell via the EFF_SETTINGS global
+    # - a $(site_effective_settings) subshell would swallow the invalid-line
+    # fatal and continue.)
+    if [ -n "$EFF_SETTINGS" ]; then
+        # FR-012 deterministic notice (lowercase "not applied" - the
+        # contract string the verification suite asserts case-sensitively)
+        echo "omd-labs-entry: NOTICE - customization inputs were supplied but not applied: site ${SITE_NAME} is an adopted/persisted volume - its stored configuration is authoritative (FR-012)"
+    fi
+}
+
+# ---- (T017) D6 row 3a: interrupted-creation recovery -------------------------
+recover_interrupted() {
+    echo "omd-labs-entry: recovering interrupted first creation of ${SITE_NAME} (in-progress marker present)"
+    # never destroy data (FR-009). Re-run the row-1 steps idempotently with
+    # per-artifact checks (each no-op-safe when the artifact exists):
+    local uid gid
+    # settings validated FIRST (fail-fast, no mutation): the account step
+    # below creates a group - the F2 guarantee is that no fail-fast leaves
+    # the volume mutated
+    site_effective_settings
+    # the identity (recorded at creation) - or infer it if lost
+    if [ -f "$IDENTITY" ]; then
+        # single line: "uid=<u> gid=<g>" (the writers' printf format)
+        uid=$(sed -n 's/uid=\([^ ]*\).*/\1/p' "$IDENTITY")
+        gid=$(sed -n 's/.* gid=\([^ ]*\).*/\1/p' "$IDENTITY")
+    else
+        infer_legacy_identity
+        uid=${uid_var:-}; gid=${gid_var:-}
+    fi
+    # (i) the account - idempotent
+    if id "${SITE_NAME}" >/dev/null 2>&1; then
+        # (T026, codex 75 B2) an existing same-name account must MATCH the
+        # volume identity (uid/primary gid/home) - a mismatch is a fatal,
+        # no mutation (the recovery would otherwise chown the volume to a
+        # foreign account's numerics)
+        local rmatch
+        rmatch=1
+        [ "$(id -u "${SITE_NAME}")" = "$uid" ] || rmatch=0
+        [ "$(id -g "${SITE_NAME}")" = "$gid" ] || rmatch=0
+        [ "$(getent passwd "${SITE_NAME}" | cut -d: -f6)" = "$SITE_DIR" ] || rmatch=0
+        [ "$rmatch" = 1 ] || fatal "FATAL: recovery: existing account ${SITE_NAME} does not match the volume identity (uid=${uid} gid=${gid} home=${SITE_DIR}) - refusing (no mutation). Remedy: userdel the account or restore the original volume."
+        echo "omd-labs-entry: recovery: account present and matches the volume identity"
+    else
+        # (T026, codex 75 B1) the identity is DATA - validate syntax before
+        # the account tools (a malformed/empty value must fatal here, not
+        # be rejected later by shadow-utils after the identity write)
+        validate_identity "$uid" "$gid"
+        if id -u "$uid" >/dev/null 2>&1; then
+            fatal "FATAL: recovery: uid ${uid} is occupied by a different account - the interrupted creation is irreconcilable. No mutation. Remedy: free the uid (userdel the conflicting account) or restore the original volume."
+        fi
+        # F2 (codex 61): the group must EXIST BY NAME for useradd - a numeric
+        # gid can carry a foreign name (or be absent). Create with the site
+        # name at the numeric gid; refuse a foreign group (no mutation).
+        if getent group "$gid" >/dev/null 2>&1; then
+            local rgname
+            rgname=$(getent group "$gid" | cut -d: -f1)
+            [ "$rgname" = "$SITE_NAME" ] || fatal "FATAL: recovery: gid ${gid} belongs to group '${rgname}', not site '${SITE_NAME}' - irreconcilable (no mutation). Remedy: free the gid or fix the recorded identity."
+        else
+            # (T026, codex 75 B1) inverse collision: a group NAMED after the
+            # site exists at a DIFFERENT gid -> useradd would bind to that
+            # group's gid (silent identity change); refuse (no mutation -
+            # the identity write below has not happened yet)
+            local rggid
+            rggid=$(getent group "${SITE_NAME}" | cut -d: -f3 || true)
+            if [ -n "$rggid" ] && [ "$rggid" != "$gid" ]; then
+                fatal "FATAL: recovery: a group named '${SITE_NAME}' exists at gid ${rggid} (the identity requests gid ${gid}) - irreconcilable (no mutation). Remedy: free the group name or fix the recorded identity."
+            fi
+            groupadd -g "$gid" "${SITE_NAME}"
+        fi
+        useradd -u "$uid" -g "${SITE_NAME}" -G omd -d "${SITE_DIR}" -s /bin/bash "${SITE_NAME}"
+    fi
+    # F2 (codex 61): the identity file is recorded AFTER the account step
+    # succeeded (validation passed) - a fail-fast must not have written to
+    # the volume. (Inferred identities are compute-only now - this is the
+    # single write point for the inference/lost-identity case.)
+    if [ ! -f "$IDENTITY" ]; then
+        printf 'uid=%s gid=%s\n' "$uid" "$gid" > "$IDENTITY"
+        chown "${SITE_NAME}:${SITE_NAME}" "$IDENTITY" 2>/dev/null || true
+        echo "omd-labs-entry: recovery: identity recorded (uid=${uid} gid=${gid})"
+    fi
+    # (ii) the apache group membership - idempotent
+    if ! id -nG "${SITE_NAME}" | tr ' ' '\n' | grep -qx "$APACHE_USER"; then
+        usermod -aG "${SITE_NAME}" "$APACHE_USER"
+    fi
+    # (iii) the fstab line - idempotent
+    # the OMD-canonical tmpfs line (omd.py add_to_fstab): the REALPATH mount
+    # point (/omd is a symlink to /opt/omd) and the uid/gid options - the
+    # presence check matches the site-specific uid=<site>, so any correct
+    # form (legacy /omd path or canonical /opt/omd path) satisfies it
+    if ! grep -q "uid=${SITE_NAME}," /etc/fstab 2>/dev/null; then
+        echo "tmpfs  /opt/omd/sites/${SITE_NAME}/tmp tmpfs noauto,user,mode=755,uid=${SITE_NAME},gid=${SITE_NAME} 0 0" >> /etc/fstab
+    fi
+    # (iv) home ownership - idempotent
+    chown "${SITE_NAME}:omd" "$SITE_DIR"
+    # the version link is CREATION EVIDENCE ONLY, never completion proof (B3):
+    # if omd create had not completed, run it (the account + tree exist now;
+    # --reuse's user_verify passes). If the version link already exists, the
+    # creation had completed - omd enable is the (idempotent) registration.
+    if [ -e "${SITE_DIR}/version" ]; then
+        run_bounded 90 "omd enable ${SITE_NAME}" omd enable "${SITE_NAME}"
+        echo "omd-labs-entry: recovery: creation had completed (version link) - re-registered"
+    else
+        run_bounded 90 "omd create --reuse ${SITE_NAME}" omd create --reuse "${SITE_NAME}"
+    fi
+    # the site IS being (re)created - apply the effective customization (D4)
+    site_customize
+    # the single completion-marker commit (AFTER customization - the ordering
+    # invariant: an injected failure between reconciliation and the commit
+    # leaves the in-progress marker present, so the next boot re-enters recovery)
+    touch "$COMPLETE"
+    chown "${SITE_NAME}:omd" "$COMPLETE" 2>/dev/null || true
+    rm -f "$INPROG"
+    echo "omd-labs-entry: recovery complete - resumed existing site ${SITE_NAME}"
+    SITE_STATE=recovered
+}
+
+# ---- (T026) the effective customization (D4, FR-010..FR-012) ----------------
+# Channels: (a) the mounted file /etc/omd-labs/site-settings.conf
+# (key=value, # comments) and (b) OMDCFG_<KEY> env vars; ENV WINS per key.
+# Scope: applied ONLY on the (re)creation paths (row 1 create / row 3a
+# recovery). Persisted (row 2) and adopted (row 3b) sites: the stored
+# configuration is authoritative - inputs are NOT applied (the FR-012
+# notice is emitted at those paths).
+#
+# INVOCATION (ground truth 2026-11-11, omd.py 5.81: `config` is
+# needs_site=1 and g_sitename = site_name() = the INVOKING USER's name -
+# a positional site is mis-consumed as the VARIABLE name):
+#   runuser -u <site> -- omd config set KEY VALUE     (no site positional)
+#   runuser -u <site> -- omd config show KEY          (stored value, even
+#                                                     for an inactive hook)
+# `set` refuses while the site is RUNNING (site_is_stopped) - this hook
+# runs exactly in that window: after omd create --reuse / omd enable,
+# BEFORE omd start (the site daemon is inactive at both call sites).
+# A failing hook `set` is SILENT (exit 0, value not stored -
+# config_set_value returns on hook rc != 0), so the show check after each
+# set is MANDATORY. Order: dependency-aware (a key whose hook declares a
+# depends on CONFIG_<PREREQ> is applied after that prerequisite from the
+# effective set - GEARMAND_PORT depends on MOD_GEARMAN=on).
+SITE_CONF_HOOKS=""   # the hooks dir of the site's OMD version (resolved once)
+
+# the site's hooks dir (resolved from the site's version symlink; the
+# version name carries dashes, so a glob is not reliable here)
+site_hooks_dir() {
+    [ -n "$SITE_CONF_HOOKS" ] && { echo "$SITE_CONF_HOOKS"; return 0; }
+    local ver h
+    ver=$(readlink -f "${SITE_DIR}/version" 2>/dev/null | xargs -r basename || true)
+    h="/omd/versions/${ver}/lib/omd/hooks"
+    [ -d "$h" ] || h=$(ls -d /omd/versions/*/lib/omd/hooks 2>/dev/null | grep -v '/default/' | head -n1 || true)
+    [ -n "$h" ] && [ -d "$h" ] || fatal "FATAL: cannot resolve the OMD hooks dir for site ${SITE_NAME} (version='${ver:-unknown}') - customization cannot be applied"
+    SITE_CONF_HOOKS=$h
+    echo "$h"
+}
+
+# effective settings as lines "KEY<TAB>VALUE" (env wins over file per key;
+# file lines without '=' or with empty keys are invalid-input fatals -
+# they are NOT comments and cannot be silently skipped, FR-011).
+# Sets the GLOBAL EFF_SETTINGS (NOT a stdout capture: a $(...) subshell
+# would swallow a fatal() and let the entry continue - the settings are
+# resolved ONCE in the main shell so an invalid line really stops the
+# entry, on every path that evaluates inputs).
+EFF_SETTINGS=""
+site_effective_settings() {
+    local conf=/etc/omd-labs/site-settings.conf line k v
+    EFF_SETTINGS=""
+    EFF_SETTINGS_PARSED=1   # (T026, codex 75 B3): consumed by site_customize_apply
+    # (a) the mounted file (optional - env-only customization is valid)
+    if [ -f "$conf" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            # trim trailing CR (a CRLF-edited file must not poison the key)
+            line=${line%$'\r'}
+            case "$line" in ''|\#*) continue;; esac
+            k=${line%%=*}
+            v=${line#*=}
+            [ "$k" != "$line" ] || fatal "FATAL: invalid line in ${conf}: '${line}' (expected key=value)" "FATAL: no site was started; fix the settings file and re-run."
+            # (T026, codex 75 B3) STRICT parse: an EMPTY key (a "=value"
+            # line) or a tab/newline inside the value cannot survive the
+            # tab/newline serialization below - they would be silently
+            # dropped or truncated. Refuse (fail-fast, pre-mutation on
+            # every path that reads inputs).
+            [ -n "$k" ] || fatal "FATAL: empty key in ${conf}: '${line}' (expected key=value)" "FATAL: no site was started; fix the settings file and re-run."
+            case "$v" in *$'\t'*|*$'\n'*) fatal "FATAL: the value of key '${k}' in ${conf} contains a tab or newline (not supported)" "FATAL: no site was started; fix the settings file and re-run.";; esac
+            # (T026, codex 77 NOTE) the KEY must also be clean: a tab
+            # inside the key would be REINTERPRETED by the tab-delimited
+            # serialization below as a key/value separator, silently
+            # changing the requested key/value. Env keys cannot carry
+            # tabs (POSIX env names), so only the file channel is exposed.
+            case "$k" in *$'\t'*|*$'\n'*) fatal "FATAL: the key on this line of ${conf} contains a tab or newline (not supported): '${line}'" "FATAL: no site was started; fix the settings file and re-run.";; esac
+            EFF_SETTINGS="${EFF_SETTINGS}${k}"$'\t'"${v}"$'\n'
+        done < "$conf"
+    fi
+    # (b) the env channel: any OMDCFG_<KEY> (env wins - later line per key).
+    # EMPIRICAL bash 5.3: the prefix expansion must be UNQUOTED - the quoted
+    # "${!OMDCFG_*}" form joins the names into one word (invalid variable).
+    # The indirection ${!e} MUST be read BEFORE the prefix strip (the
+    # variable is named OMDCFG_<KEY>, not <KEY>).
+    local e key
+    for e in ${!OMDCFG_*}; do
+        key=${e#OMDCFG_}
+        [ -n "$key" ] || fatal "FATAL: invalid customization env var '${e}' - the key is empty (use OMDCFG_<KEY>=<value>)" "FATAL: nothing was started (pre-init, FR-011)."
+        # (T026, codex 75 B3) an EMPTY KEY via env (OMDCFG_=value) and a
+        # control-character value are refused the same way as from the file
+        # (env names cannot be empty - the prefix check above - but the
+        # VALUE can carry a tab via `env` tooling; the serialization is
+        # tab-delimited, so a tab would corrupt a DIFFERENT key's value)
+        case "${!e}" in *$'\t'*|*$'\n'*) fatal "FATAL: the value of env var ${e} contains a tab or newline (not supported)" "FATAL: nothing was started (pre-init, FR-011).";; esac
+        EFF_SETTINGS="${EFF_SETTINGS}${key}"$'\t'"${!e}"$'\n'
+    done
+    # env wins per key: last line per key wins (file lines first, env lines
+    # after); stable key order for a deterministic summary
+    [ -z "$EFF_SETTINGS" ] && return 0
+    EFF_SETTINGS=$(printf '%s' "$EFF_SETTINGS" | awk -F'\t' '{a[$1]=$2} END{for (k in a) printf "%s\t%s\n", k, a[k]}' | sort -t$'\t' -k1,1)
+}
+
+# cfg_timeout <deadline-s> <cmd...>: run an omd config subprocess bounded by
+# <deadline-s> (a RE-COMPUTED share of the remaining bootstrap budget, never
+# a value captured before an earlier subprocess consumed its own share).
+# OUTPUT CAPTURE: the child writes to a temp FILE, not to a pipe. EMPIRICAL
+# (both distros): `out=$(timeout -k 0 2 <term-ignoring child>)` does NOT
+# return at the deadline - the command substitution waits for the pipe EOF,
+# and an orphaned grandchild (a hook script the KILLed parent left behind)
+# keeps the write end open INDEFINITELY (GNU timeout signals the foreground
+# process group; a backgrounded grandchild survives the group KILL). The
+# file capture removes the pipe entirely: the shell waits ONLY for the
+# `timeout` process itself, which dies at deadline+grace by construction.
+# ESCALATION: `timeout -k 1` sends TERM at <deadline-s> and KILLs the
+# child's process group 1 s later. A TERM-IGNORING child therefore cannot
+# hold PID1 past deadline+1 (a hook script that traps TERM). The KILL
+# escalation MUST exist (grace >= 1): EMPIRICAL, `timeout -k 0` sends TERM
+# and then WAITS FOR THE CHILD TO DIE - a TERM-ignoring child outlives the
+# deadline and the timeout process itself (and thus the caller) blocks until
+# the child exits on its own. The worst case adds 1 s past the deadline;
+# the budget exhaustion fatals (rem_budget <= 0) already gate the entry, so
+# the total overshoot is bounded by that single 1 s.
+# rc 124 = TERM at the deadline, 137 = KILLed after ignoring TERM - both
+# are fatal start failures like any other (the caller checks rc).
+cfg_timeout() { # cfg_timeout <deadline-s> <cmd...>
+    local dl=$1; shift
+    local rc tfile
+    tfile=$(mktemp /tmp/omd-cfgout.XXXXXX)
+    rc=0
+    timeout -k 1 "$dl" "$@" >"$tfile" 2>&1 || rc=$?
+    printf '%s' "$(cat "$tfile" 2>/dev/null)"
+    rm -f "$tfile" 2>/dev/null || true
+    return "$rc"
+}
+
+# the set-then-show application loop (dependency-aware, FR-010/FR-011).
+# Fatal on the FIRST bad key/value (nothing has started - FR-011).
+# Sets SITE_CUSTOM_APPLIED/SITE_CUSTOM_SUMMARY on success.
+# (T026, codex 75 B3) the apply reuses the PRE-MUTATION parse when the
+# caller already ran site_effective_settings before its first write
+# (EFF_SETTINGS_PARSED=1): the input is static for the boot, and a
+# re-parse after mutation could observe a swapped bind mount and fatal
+# after the identity/complete-marker writes.
+site_customize_apply() {
+    if [ "${EFF_SETTINGS_PARSED:-0}" != 1 ]; then
+        site_effective_settings
+    fi
+    local conf=$EFF_SETTINGS
+    if [ -z "$conf" ]; then
+        echo "omd-labs-entry: no customization inputs - skipping"
+        return 0
+    fi
+    local h
+    h=$(site_hooks_dir)
+    local -a keys=()
+    local key v
+    while IFS=$'\t' read -r key v; do
+        [ -n "${key:-}" ] && keys+=("$key")
+    done <<<"$conf"
+    # dependency-aware (topological) order: a key is DEFERRED while any of
+    # its hook depends (CONFIG_<PREREQ>) is present in the EFFECTIVE set
+    # and not yet ORDERED (D4/N3: a dependent key is applied AFTER its
+    # prerequisite - GEARMAND_PORT after MOD_GEARMAN). A prereq that is
+    # NOT in the effective set imposes no ordering constraint (the hook's
+    # depends stays unsatisfied; OMD's own config_set_all re-runs every
+    # hook on each set, and the mandatory show check still verifies the
+    # stored value). Passes <= n+1; a pass with no progress breaks the
+    # loop (cyclic deps) and the remainder is applied in the EFFECTIVE
+    # SETTINGS order (EFF_SETTINGS is sorted by key - deterministic, NOT
+    # the original input/file order; codex 75 N3).
+    local -a ordered=()
+    local n=${#keys[@]} p idx k d deps ok progressed
+    for p in $(seq 0 "$n"); do
+        progressed=0
+        for k in "${keys[@]}"; do
+            # already ordered?
+            local already=0
+            for idx in "${ordered[@]:-}"; do [ "$idx" = "$k" ] && { already=1; break; }; done
+            [ "$already" = 1 ] && continue
+            deps=""
+            [ -f "$h/${k}" ] && deps=$(awk '/depends\)/{f=1;next} f&&/;;/{f=0} f' "$h/${k}" 2>/dev/null | grep -oE 'CONFIG_[A-Za-z_0-9]+' | sed 's/^CONFIG_//' | sort -u || true)
+            ok=1
+            for d in $deps; do
+                # constraint only when the prereq is part of the effective set
+                local in_set=0
+                printf '%s\n' "$conf" | awk -F'\t' -v k="$d" '$1==k{f=1} END{exit f?0:1}' && in_set=1
+                [ "$in_set" = 1 ] || continue
+                # prereq present: it must already be ordered
+                local done_already=0
+                for idx in "${ordered[@]:-}"; do [ "$idx" = "$d" ] && { done_already=1; break; }; done
+                [ "$done_already" = 1 ] || { ok=0; break; }
+            done
+            if [ "$ok" = 1 ]; then
+                ordered+=("$k")
+                progressed=1
+            fi
+        done
+        [ "$progressed" = 1 ] || break
+    done
+    # (no-progress remainder - cyclic deps) applied in effective-settings
+    # (sorted-key) order
+    for k in "${keys[@]}"; do
+        local inordered=0
+        for idx in "${ordered[@]:-}"; do [ "$idx" = "$k" ] && { inordered=1; break; }; done
+        [ "$inordered" = 0 ] && ordered+=("$k")
+    done
+    # apply in dependency-aware order: set + mandatory show verification
+    # (a failing hook set is SILENT - rc 0, value not stored)
+    local applied="" val shown out rc
+    # (T026, codex 75 B4 + codex 77 BLOCKER) every omd config subprocess
+    # runs under its OWN re-computed share of the REMAINING bootstrap
+    # budget (codex 77: the pre-fix code used the SAME cbt for set AND
+    # show - if set consumed most of the remaining budget, show still
+    # received the original allowance and the bootstrap could exceed the
+    # 120 s bound; and a TERM-ignoring subprocess had no KILL escalation):
+    #   set  -> min(rem_budget, 90)   (the 90 s cap run_bounded uses for
+    #    omd create/enable - a hook's config_set can legitimately run a
+    #    submodule build)
+    #   show -> min(rem_budget, 30)   (show is a read; re-computed AFTER
+    #    the set has consumed its share, so set + show can never sum to
+    #    more than the budget the set started with)
+    # The SHOW must EXIT SUCCESSFULLY (codex 77: a failed show used to be
+    # ignored via `|| true`) and produce NON-EMPTY output before the
+    # equality check (a failed show with an empty requested value could
+    # otherwise pass the comparison vacuously).
+    local applied="" val shown out rc sbt sht
+    for key in "${ordered[@]}"; do
+        sbt=$(rem_budget)
+        [ "$sbt" -le 0 ] && fatal "FATAL: bootstrap budget (${BOOTSTRAP_BUDGET}s) exhausted before customization ${key}"
+        val=$(printf '%s\n' "$conf" | awk -F'\t' -v k="$key" '$1==k{print $2; exit}')
+        [ 90 -lt "$sbt" ] && sbt=90
+        echo "omd-labs-entry: customization: omd config set ${key} = ${val} (bounded: ${sbt}s)"
+        rc=0
+        out=$(cfg_timeout "$sbt" runuser -u "${SITE_NAME}" -- omd config set "$key" "$val" 2>&1) || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            fatal "FATAL: invalid customization ${key}=${val}: omd config set refused it (rc=${rc}; 124 = budget timeout, 137 = killed after ignoring TERM)" "FATAL: nothing was started (pre-init, FR-011). Fix the key/value - run 'runuser -u ${SITE_NAME} -- omd config show <KEY>' for the valid values. omd said: ${out}"
+        fi
+        # the show: its OWN re-computed share (remaining AFTER the set),
+        # capped at 30 s, and never allowed to push the bootstrap past the
+        # 120 s pre-init bound
+        sht=$(rem_budget)
+        [ "$sht" -le 0 ] && fatal "FATAL: bootstrap budget (${BOOTSTRAP_BUDGET}s) exhausted before the show check for ${key}"
+        [ 30 -lt "$sht" ] && sht=30
+        rc=0
+        shown=$(cfg_timeout "$sht" runuser -u "${SITE_NAME}" -- omd config show "$key" 2>/dev/null) || rc=$?
+        [ "$rc" -eq 0 ] || fatal "FATAL: invalid customization ${key}=${val}: omd config show failed (rc=${rc}; 124 = budget timeout, 137 = killed) - cannot verify the stored value" "FATAL: nothing was started (pre-init, FR-011). Fix the key/value - run 'runuser -u ${SITE_NAME} -- omd config show <KEY>' for the valid values."
+        [ -n "$shown" ] || fatal "FATAL: invalid customization ${key}=${val}: omd config show returned empty output - cannot verify the stored value" "FATAL: nothing was started (pre-init, FR-011). Fix the key/value - run 'runuser -u ${SITE_NAME} -- omd config show <KEY>' for the valid values."
+        [ "$shown" = "$val" ] || fatal "FATAL: invalid customization ${key}=${val}: the stored value '${shown}' does not match the input - the OMD hook rejected the value silently" "FATAL: nothing was started (pre-init, FR-011). Fix the key/value - run 'runuser -u ${SITE_NAME} -- omd config show <KEY>' for the valid values."
+        applied="${applied}${applied:+, }${key}=${val}"
+    done
+    SITE_CUSTOM_APPLIED=1
+    SITE_CUSTOM_SUMMARY="customization applied: ${applied}"
+    echo "omd-labs-entry: ${SITE_CUSTOM_SUMMARY}"
+}
+
+site_customize() {
+    site_customize_apply
+}
+
+# ---- T024: the SSH credential file (D7) ------------------------------------
+# The documented mount form: -v <key.pub>:/root/.ssh/omd_ssh_keys:ro (the ONLY
+# documented path - the authorized_keys:ro form is unsupported: its mount point
+# IS the copy destination, where a :ro bind cannot be chmodded/overwritten).
+# Copy-not-mutate (B1): the :ro bind is NEVER mutated - no chmod, no write
+# targets the source. The destination is image-owned: /root/.ssh
+# (0700 root:root via install -d) + /root/.ssh/authorized_keys (0644 -
+# sshd StrictModes rejects a group/other-writable key file). Malformed or
+# empty key file => exit 1 pre-init, naming the file (FR-019 class, D7:
+# a broken key file = no SSH access, which the readiness gate would
+# otherwise mask as a container bug). No key mounted => sshd up but
+# unusable - the documented expected state (FR-003: no baked secret;
+# root remains reachable via exec).
+site_ssh() {
+    local src=/root/.ssh/omd_ssh_keys
+    # an existing DIRECTORY at the source path is NOT the "no key" state -
+    # it is a mis-mount (e.g. a missing source file): fail fast, naming it
+    if [ -d "$src" ]; then
+        fatal "FATAL: ${src} is a directory, not a key file - check the documented mount source (-v <key.pub>:/root/.ssh/omd_ssh_keys:ro). No site was started."
+    fi
+    [ -f "$src" ] || return 0
+    echo "omd-labs-entry: SSH credential file found - validating (per line) + copying (source never mutated)"
+    # (1) validate (D7): non-empty, at least one REAL key, and every
+    # non-comment line a well-formed OpenSSH public key. TWO passes per
+    # line: (i) the contract shape regex (type + base64 blob + optional
+    # comment - `.*` comment part, since OpenSSH allows multi-word
+    # comments) as the fast shape gate, (ii) OpenSSH's OWN parser
+    # (ssh-keygen -l on the single line) as the validity gate - a
+    # regex-shaped but corrupt key (space inside the blob, bogus type,
+    # type/blob mismatch) fails here, not at sshd login time. A broken key
+    # file = no SSH access; fail pre-init (FR-019 class), naming the file
+    # AND the offending line.
+    if [ ! -s "$src" ]; then
+        fatal "FATAL: SSH public key file at ${src} is empty - a broken key file means no SSH access. No site was started."
+    fi
+    local n=0 line s keys=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        n=$((n + 1))
+        s=${line#"${line%%[![:space:]]*}"}   # trim leading whitespace (legal in authorized_keys)
+        [ -z "$s" ] && continue
+        case $s in '#'*) continue ;; esac
+        if ! printf '%s\n' "$s" | grep -Eq '^(ssh-|ecdsa-|sk-)[a-z0-9.-]+ [A-Za-z0-9+/=]+( .*)?$'; then
+            fatal "FATAL: malformed SSH public key file at ${src} (line ${n}) - not shaped like an OpenSSH public key. A broken key file means no SSH access. No site was started."
+        fi
+        if ! printf '%s\n' "$s" | ssh-keygen -l -f /dev/stdin >/dev/null 2>&1; then
+            fatal "FATAL: malformed SSH public key file at ${src} (line ${n}) - OpenSSH cannot parse this key (corrupt blob or type mismatch). A broken key file means no SSH access. No site was started."
+        fi
+        keys=$((keys + 1))
+    done < "$src"
+    if [ "$keys" -lt 1 ]; then
+        fatal "FATAL: SSH public key file at ${src} contains no public key (comment/blank lines only) - a broken key file means no SSH access. No site was started."
+    fi
+    # (2) install image-owned, root-only (install -d is idempotent - the
+    # image ships no key; an existing /root/.ssh is left as-is, mode-forced)
+    install -d -m 0700 -o root -g root /root/.ssh
+    # copy the VALIDATED source to the image-owned destination and fix the
+    # permissions on the COPY (sshd StrictModes) - never on the :ro bind
+    cp "$src" /root/.ssh/authorized_keys
+    chown root:root /root/.ssh/authorized_keys
+    chmod 0644 /root/.ssh/authorized_keys
+    echo "omd-labs-entry: authorized_keys provisioned (0644 root:root, dir 0700; source bind untouched)"
+}
+
+# ---- main --------------------------------------------------------------------
+echo "omd-labs-entry: pre-init bootstrap (container start)"
+
+# the prerequisite check (FR-020/SC-011) - readable error, never hang
+if [ "$(id -u)" != "0" ]; then
+    fatal "FATAL: omd-labs requires root inside the container (run with --privileged, the documented default - see README 'Runtime prerequisites')"
+fi
+if [ -d /sys/fs/cgroup ] && [ ! -w /sys/fs/cgroup ]; then
+    fatal "FATAL: /sys/fs/cgroup is not writable - the container lacks the capabilities systemd needs. Run with --privileged (documented default) or the reduced recipe: --cap-add=SYS_ADMIN --cap-add=MKNOD --tmpfs=/run --tmpfs=/run/lock --tmpfs=/tmp (README 'Runtime prerequisites'). Host must use cgroup v2."
+fi
+
+if [ -n "${SITENAME:-}" ]; then
+    # CRITICAL: the site path + validation use SITE_NAME (the RESOLVED value);
+    # it must be taken from the runtime SITENAME before site_resolve validates
+    SITE_NAME="${SITENAME}"
+    site_resolve      # T015: validation + SITE_ACTIVE=1
+    # the site path (MUST follow the resolution - the path depends on the name)
+    SITE_DIR="/omd/sites/${SITE_NAME}"
+    INPROG="${SITE_DIR}/.omd-labs-init-inprogress"
+    COMPLETE="${SITE_DIR}/.omd-labs-init-complete"
+    IDENTITY="${SITE_DIR}/.omd-labs-site-identity"
+    site_mount        # T016/T017: the D6 state machine
+fi
+# no-site path (row 5): the mount is left untouched (no account, no markers,
+# no writes - FR-006)
+
+site_ssh              # D7 - T024
+
+# /run/omd-labs.env (D9) - systemd EnvironmentFile syntax: NAME="value"
+write_env() { # write_env <SITE_ACTIVE> <SITE_NAME> <SITE_CUSTOM_APPLIED> [summary...]
+    local active=$1 name=$2 applied=$3; shift 3 || true
+    local summary=""
+    [ $# -gt 0 ] && summary="$*"
+    name=${name//\\/\\\\}; name=${name//\"/\\\"}
+    summary=${summary//\\/\\\\}; summary=${summary//\"/\\\"}
+    {
+        printf 'SITE_ACTIVE="%s"\n' "$active"
+        printf 'SITE_NAME="%s"\n' "$name"
+        printf 'SITE_CUSTOM_APPLIED="%s"\n' "$applied"
+        [ -n "$summary" ] && printf '# SITE_CUSTOM_SUMMARY=%s\n' "$summary"
+    } > /run/omd-labs.env
+    chmod 0644 /run/omd-labs.env
+}
+if [ "$SITE_ACTIVE" = "1" ]; then
+    # T026: SITE_CUSTOM_APPLIED + the summary are set by site_customize()
+    # (row 1/3a) and default to 0/empty (rows 2/3b/3c and no-site)
+    write_env "1" "$SITE_NAME" "$SITE_CUSTOM_APPLIED" "${SITE_CUSTOM_SUMMARY:-site ${SITE_NAME} (${SITE_STATE:-unknown})}"
+else
+    write_env "0" "" "0" "no site - base services only"
+fi
+
+# the orphaned log forwarder (C5) - CRITICAL: no stdout redirection (it must
+# inherit fd 1 = the container log pipe; the only writable handle after init
+# reopens its stdio to /dev/null). Spawned before exec /sbin/init; reparented
+# to systemd - it outlives the entry. Pure logger - its death degrades only
+# the log channel, never the exit path (D3). Its PID -> /run/fwd.pid (the
+# probe's direct-copy target - D3 step 6).
+/usr/local/bin/omd-labs-forwarder &
+echo $! > /run/fwd.pid
+
+if [ "$SITE_ACTIVE" = "1" ]; then
+    echo "omd-labs-entry: SITE_ACTIVE=1 SITE_NAME=${SITE_NAME} state=${SITE_STATE:-?} (systemd starting)"
+else
+    echo "omd-labs-entry: no site - base services only (systemd starting)"
+fi
+
+# (e) exec /sbin/init - init owns the lifetime (FR-001)
+exec /sbin/init

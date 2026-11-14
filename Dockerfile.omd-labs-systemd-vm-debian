@@ -1,0 +1,106 @@
+FROM debian:13
+LABEL org.opencontainers.image.authors="Lassi"
+LABEL org.opencontainers.image.source="https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge"
+EXPOSE 80 443 22 4730 5666
+
+ENV REFRESHED=20250918
+
+#### user environment ######################################
+ENV HOME=/root
+WORKDIR $HOME
+
+### OMD installation ######################################
+ARG OMD_VERSION
+ARG INSTALL_COMMON_RETRIES=1
+ADD ./scripts/install_*.sh $HOME/
+RUN chmod +x $HOME/install_*.sh
+RUN $HOME/install_retry.sh -r $INSTALL_COMMON_RETRIES -d 30 -- $HOME/install_common.sh debian
+RUN $HOME/install_omd.sh debian $OMD_VERSION
+# systemd presence assertion (research.md C2 — zero package delta expected,
+# systemd arrives as an OMD dependency): fail loudly at build time if a
+# base/OMD change ever breaks systemd-as-PID1
+RUN test -x /sbin/init
+
+#### ansible ################################################
+# Ansible stays installed in the image (available via `exec`); the default
+# cfg is copied for its documented path. The v1 ANSIBLE_DROPIN/
+# ANSIBLE_CONFIG/ANSIBLE_VERBOSITY env vars are retired — no longer accepted
+# in the startup path (v2).
+COPY ansible_dropin/ansible.cfg /root/ansible_dropin/ansible.cfg
+
+#### Mount point space requirements (MB)
+ARG VOL_ETC_MB_MIN
+ARG VOL_LOCAL_MB_MIN
+ARG VOL_VAR_MB_MIN
+
+ENV VOL_ETC_MB_MIN=$VOL_ETC_MB_MIN
+ENV VOL_LOCAL_MB_MIN=$VOL_LOCAL_MB_MIN
+ENV VOL_VAR_MB_MIN=$VOL_VAR_MB_MIN
+
+#### systemd container boot (v2) ############################
+# The site is NO LONGER created at build time (the old DEMO-site block and
+# the NEW_SITENAME ONBUILD instructions are retired — the runtime SITENAME
+# env var selects the site; empty/absent = no site).
+#
+# Stop contract (research.md D2): SIGTERM to the systemd SYSTEM manager
+# re-executes it instead of stopping it [EMPIRICAL]; SIGRTMIN+3 triggers
+# halt.target — an ordered, clean stop.
+STOPSIGNAL SIGRTMIN+3
+
+# the v2 scripts (packaging contract — plan.md Project Structure)
+COPY scripts/omd-labs-entry /usr/local/bin/omd-labs-entry
+COPY scripts/omd-ready-check /usr/local/bin/omd-ready-check
+COPY scripts/omd-site-start /usr/local/bin/omd-site-start
+COPY scripts/omd-site-stop /usr/local/bin/omd-site-stop
+COPY scripts/omd-labs-forwarder /usr/local/bin/omd-labs-forwarder
+RUN chmod 0755 /usr/local/bin/omd-labs-entry /usr/local/bin/omd-ready-check /usr/local/bin/omd-site-start /usr/local/bin/omd-site-stop /usr/local/bin/omd-labs-forwarder
+
+# the v2 units (omd-site.service, omd-ready.service + README-units.md — the
+# .md is inert in the unit dir). The ready gate's edge unit is distro-
+# specific: @EDGE_UNIT@ is substituted here (units/README-units.md — the
+# documented T011 choice).
+COPY units/ /usr/lib/systemd/system/
+RUN sed -i -e 's/@EDGE_UNIT@/apache2.service/' -e 's/@SSH_UNIT@/ssh.service/' /usr/lib/systemd/system/omd-ready.service
+
+# build-time unit state (research.md D8, superseded 2026-11-13 by
+# specs/001-systemd-vm-startup/debate/100-103 — the mask was a UX defect:
+# `systemctl status omd` reported masked/dead while the site runs):
+# - the generic all-sites omd.service is NOT masked: omd-site.service
+#   carries Alias=omd.service (units/omd-site.service [Install] — the
+#   shipped unit, like reboot.target's Alias=ctrl-alt-del.target), so
+#   `systemctl status omd` reflects the selected site (single-active-site
+#   contract, same controller). Mechanism notes:
+#     (1) `systemctl enable omd-site.service` (below) creates BOTH the
+#         canonical wants symlink and the /etc alias symlink
+#         /etc/systemd/system/omd.service -> omd-site.service.
+#     (2) the Alias= is INERT until enablement — an unactivated Alias=
+#         resolves to nothing (debate/101 F3), hence the loud build-time
+#         assertion below;
+#     (3) systemd 252 (Rocky) has no `systemctl enable --alias` — the
+#         unit-file Alias= is the version-independent mechanism
+#         (debate/102 E4).
+#   The OMD package pre-enables omd.service (a
+#   multi-user.target.wants/omd.service symlink to the vendor all-sites
+#   unit) — drop it so the enabled-set audit stays exact; the /etc alias
+#   shadows the vendor unit at load time, so the vendor file (package-owned)
+#   stays untouched. `journalctl -u omd` yields no entries — filter on
+#   omd-site (debate/102 E5).
+# - getty@tty1 is disabled (container console model — no getty in a container)
+# - omd-site + omd-ready are ENABLED (offline enable creates the
+#   multi-user.target.wants/ symlinks + the omd.service alias); sshd +
+#   apache2 stay pre-enabled by the OMD package (no enable lines needed — D8)
+# Order matters [EMPIRICAL]: `systemctl enable` refuses to create an alias
+# when /etc/systemd/system/omd.service already exists — the old images carry
+# the D8 mask (a /dev/null symlink) there — so UNMASK FIRST.
+RUN rm -f /etc/systemd/system/omd.service \
+          /etc/systemd/system/multi-user.target.wants/omd.service
+RUN systemctl disable getty@tty1.service
+RUN systemctl enable omd-site.service omd-ready.service
+# loud build-time assertion (C2 style): the alias must be a symlink to the
+# canonical unit. An unactivated Alias= or a leftover mask would silently
+# break the `systemctl status omd` contract (debate/101 F3).
+RUN test -L /etc/systemd/system/omd.service \
+    && test "$(readlink -f /etc/systemd/system/omd.service)" \
+         = /usr/lib/systemd/system/omd-site.service
+
+CMD ["/usr/local/bin/omd-labs-entry"]

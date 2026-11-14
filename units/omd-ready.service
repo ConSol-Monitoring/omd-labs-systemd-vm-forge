@@ -1,0 +1,42 @@
+# omd-ready.service - the bounded readiness gate (research.md D3, FR-018).
+# The ONLY unit carrying a container-fatal failure action (site/edge/sshd
+# carry none - FR-019 second half: a post-ready crash never exits the
+# container).
+#
+# - oneshot + RemainAfterExit=yes: a successful gate stays "active (exited)"
+#   - `systemctl is-active omd-ready` is the documented, bounded readiness
+#   signal (contracts/invocation.md "Readiness"); on a fatal start the
+#   container has already exited 1/2 - the gate never reports success.
+# - After= ONLY - NO Requires=/Wants= ([EMPIRICAL]: Requires= cancels the
+#   gate's start job when a dependency failed, so the probe would never
+#   run and the container would silently stay up with the site dead;
+#   After=-only still runs it - a failed dependency unblocks the gate,
+#   which then inspects the per-unit states itself and exits 1/2).
+# - TimeoutStartSec=150s backstop (B2): a HUNG probe is killed at 150 s
+#   (unit failed) - the probe's own 120 s window never fires when the
+#   probe itself hangs, so this backstop is the only layer that catches
+#   it; the kill makes the unit `failed` and the FailureAction fires
+#   (systemd-native probe-death fallback - no watchdog unit).
+# - [Unit] FailureAction=exit with NO FailureActionExitStatus: the probe's
+#   own exit code (1 = a readiness condition failed / 2 = deadline) becomes
+#   the container's (the override-wins gotcha is A/B-verified - a
+#   FailureActionExitStatus would collapse the 1/2 distinction).
+# - ExecStopPost=/usr/local/bin/omd-site-stop: defense-in-depth cleanup in
+#   the FailureAction stop sequence (guarded wrapper, always-exit-0).
+# - @EDGE_UNIT@ is substituted at build time (the Dockerfile sed - the
+#   documented T011 choice, units/README-units.md): httpd.service (Rocky)
+#   / apache2.service (Debian).
+[Unit]
+Description=OMD labs bounded readiness gate (FR-018)
+After=omd-site.service @EDGE_UNIT@ @SSH_UNIT@
+FailureAction=exit
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=150s
+ExecStart=/usr/local/bin/omd-ready-check
+ExecStopPost=/usr/local/bin/omd-site-stop
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,81 @@
+# This file is used to manage local images
+# depending of the current dir and branch.
+# Branch 'master' leads to no tag (=latest),
+# others to "local/[dirname]:[branchname]"
+# the build hook (hooks/build) derives the Dockerfile name from DOCKER_REPO:
+# Dockerfile.omd-labs-systemd-vm-<distro>
+
+ifeq ($(strip $(DISTRO)),)
+    $(error DISTRO must not be empty, use Makefile.omd-labs-* instead)
+endif
+
+LOCAL_HTTPS_PORT ?= 8443
+
+# local builds will be named like this
+REPO = local/omd-labs-systemd-vm-$(DISTRO)
+BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
+# BRANCH=TAG, but "master"="nightly"
+TAG  = $(shell git rev-parse --abbrev-ref HEAD | sed 's/master/nightly/')
+# the final image name
+IMAGE=$(REPO):$(TAG)
+
+# v2: SITENAME is a RUNTIME variable — the container selects the site at
+# start (empty/absent = no site, base services only). The `?=` demo default
+# is a command-line convenience, NOT an image default (the image no longer
+# bakes a site in — the build-time site block is retired).
+SITENAME ?= demo
+
+# the container runtime. The documented invocation is `--privileged`
+# (+ `--systemd=always` on podman — its wrapper CMD does not match the
+# auto-trigger's literal-command check).
+RUNTIME ?= docker
+ifeq ($(RUNTIME),podman)
+  RTFLAGS = --systemd=always
+else
+  RTFLAGS =
+endif
+
+# SELinux-Enforcing hosts need the :z mount label on shared volume mounts
+# (EMPIRICAL: a raw bind of a host dir is denied by the AVC policy).
+# Overridable: make ... SELABEL=
+SELABEL ?= $(shell getenforce 2>/dev/null | grep -qx Enforcing && printf ':z')
+
+export DOCKER_REPO=index.docker.io/consol/omd-labs-$(DISTRO)
+export IMAGE_NAME=$(IMAGE)
+export SOURCE_BRANCH=$(BRANCH)
+
+.PHONY: build start startvol stop echo
+
+build:
+	# the hook is also executed on Docker Hub
+	./hooks/build
+	@echo "Successfully built" $(IMAGE)
+
+# documented invocation (contracts/invocation.md "Make targets", v2):
+# runtime SITENAME + the privileged flags; the build no longer passes
+# SITENAME as a build argument (the build-time site is removed).
+start:
+	$(RUNTIME) run $(RTFLAGS) --privileged --name omd-labs-$(SITENAME) \
+	-d -p $(LOCAL_HTTPS_PORT):443 -e SITENAME=$(SITENAME) $(IMAGE)
+
+# start + a volume mounted at the site path (matches the runtime site name;
+# the old demo-defaulted mount path is gone). VOLUME is required.
+ifeq ($(strip $(VOLUME)),)
+startvol:
+	@echo "startvol requires VOLUME: make startvol VOLUME=/tmp/omd-make-vol SITENAME=make1" >&2; exit 1
+else
+startvol:
+	$(RUNTIME) run $(RTFLAGS) --privileged --name omd-labs-$(SITENAME) \
+	-d -p $(LOCAL_HTTPS_PORT):443 \
+	-v $(VOLUME):/omd/sites/$(SITENAME)$(SELABEL) \
+	-e SITENAME=$(SITENAME) $(IMAGE)
+endif
+
+# documented stop (research.md D2): the image's STOPSIGNAL SIGRTMIN+3 does
+# the ordered halt; -t 30 = the documented timeout (works on docker and
+# podman). Clean halt exits 130 (privileged) / 0 (rootless) — NOT a failure.
+stop:
+	$(RUNTIME) stop -t 30 omd-labs-$(SITENAME)
+
+echo:
+	@echo $(IMAGE)

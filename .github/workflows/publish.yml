@@ -1,0 +1,183 @@
+# Publish to GHCR - triggered by the OMD build pipeline (webhook).
+#
+# The OMD build pipeline (ConSol intranet) posts a repository_dispatch after
+# publishing an OMD package:
+#
+#   curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+#     -H "Accept: application/vnd.github+json" \
+#     https://api.github.com/repos/ConSol-Monitoring/omd-labs-systemd-vm-forge/dispatches \
+#     -d '{"event_type":"omd-published","client_payload":{"omd_version":"master"}}'
+#
+# omd_version values (scripts/install_omd.sh mapping):
+#   master -> omd-labs-edition-daily from the testing repo  -> tag nightly
+#   latest -> omd-labs-edition        from the stable repo  -> tag latest
+#   5.81   -> omd-5.81-labs-edition   from the stable repo  -> tag v5.81
+#
+# The build checks out the matching ref (master / latest / v5.81) so the
+# repository content matches the OMD package. A manual workflow_dispatch
+# with the same input is the fallback (e.g. for a republish).
+name: Publish (OMD webhook)
+
+on:
+  repository_dispatch:
+    types: [omd-published]
+  workflow_dispatch:
+    inputs:
+      omd_version:
+        description: 'OMD package version: master (daily/testing), latest (stable), or e.g. 5.81 (versioned stable)'
+        type: string
+        required: true
+      debug_enabled:
+        type: boolean
+        description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
+        required: false
+        default: false
+
+env:
+  INPUT_OMD: ${{ inputs.omd_version || github.event.client_payload.omd_version }}
+
+jobs:
+  # resolve the target (checkout ref, docker tag, OMD package version)
+  resolve:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      omd: ${{ steps.r.outputs.omd }}
+      ref: ${{ steps.r.outputs.ref }}
+      tag: ${{ steps.r.outputs.tag }}
+    steps:
+      - name: Resolve
+        id: r
+        run: |
+          omd="$INPUT_OMD"
+          case "$omd" in
+            master|latest) ref=$omd;;
+            *) ref=v${omd};;
+          esac
+          case "$omd" in
+            master) tag=nightly;;
+            latest) tag=latest;;
+            *)      tag=v${omd};;
+          esac
+          echo "omd=$omd"  >> "$GITHUB_OUTPUT"
+          echo "ref=$ref"  >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"  >> "$GITHUB_OUTPUT"
+          echo "::notice title=Publish::OMD package $omd, checkout ref $ref, image tag $tag"
+
+  docker_build:
+    runs-on: ${{ matrix.target.runs }}
+    needs: resolve
+    permissions:
+      packages: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - rocky
+          - debian
+        target:
+          - runs: ubuntu-24.04
+            platform: amd64
+          - runs: ubuntu-24.04-arm
+            platform: arm64
+    steps:
+      - name: Check out the repo (matching ref)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      # Docker Hub publishing is disabled for now; images go to GHCR only.
+      # - name: Log in to Docker Hub
+      #   uses: docker/login-action@v4.8.0
+      #   with:
+      #     username: ${{ secrets.DOCKER_USERNAME }}
+      #     password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log in to GitHub Docker Registry
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          # built-in workflow token (short-lived, per-run; the job's
+          # "permissions: packages: write" grants the GHCR push) - no
+          # personal account, no stored secret
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Setup tmate session, see https://github.com/marketplace/actions/debugging-with-tmate
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v7
+        with:
+          push: true
+          file: Dockerfile.omd-labs-systemd-vm-${{ matrix.os }}
+          sbom: false
+          provenance: false
+          build-args: |
+            OMD_VERSION=${{ needs.resolve.outputs.omd }}
+            INSTALL_COMMON_RETRIES=3
+            BUILDKIT_MULTI_PLATFORM=0
+          # Docker Hub publishing is disabled for now (GHCR only). The
+          # disabled tag is kept OUT of the tags block on purpose: the
+          # build-push action passes every line of the block to buildx,
+          # so a comment line there becomes an invalid tag.
+          # consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-${{ matrix.target.platform }}
+          tags: |
+            ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-${{ matrix.target.platform }}
+          platforms: linux/${{ matrix.target.platform }}
+
+  manifest:
+    runs-on: ubuntu-24.04
+    needs: [resolve, docker_build]
+    permissions:
+      packages: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - rocky
+          - debian
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.ref }}
+
+      # Docker Hub publishing is disabled for now; images go to GHCR only.
+      # - name: Log in to Docker Hub
+      #   uses: docker/login-action@v4.8.0
+      #   with:
+      #     username: ${{ secrets.DOCKER_USERNAME }}
+      #     password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log in to GitHub Docker Registry
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          # built-in workflow token (short-lived, per-run; the job's
+          # "permissions: packages: write" grants the GHCR push) - no
+          # personal account, no stored secret
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Setup tmate session, see https://github.com/marketplace/actions/debugging-with-tmate
+        uses: mxschmitt/action-tmate@v3
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+
+      # Docker Hub publishing is disabled for now; images go to GHCR only.
+      # - name: push manifest to dockerhub
+      #   run: |
+      #       docker manifest create consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }} \
+      #                              consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-amd64 \
+      #                              consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-arm64
+      #       docker manifest push consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}
+
+      - name: push manifest to github
+        run: |
+            docker manifest create ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }} \
+                                   ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-amd64 \
+                                   ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-arm64
+            docker manifest push ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}

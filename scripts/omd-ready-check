@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# omd-ready-check - the bounded readiness probe (research.md D3, FR-018,
+# contracts/readiness-and-failures.md). ExecStart of omd-ready.service -
+# the ready gate runs After=-only on omd-site + the distro edge + sshd
+# (NO Requires=/Wants= - [EMPIRICAL] Requires= cancels the gate's start
+# job when a dependency failed, so the probe would never run and the
+# container would silently stay up with the site dead).
+#
+# Polls until the deadline (120 s - the gate window), each iteration:
+#   (1) per-unit ActiveState/Result of omd-site, the distro edge unit
+#       (httpd Rocky / apache2 Debian) and sshd - failed => fatal rc 1;
+#       transient (activating) => wait. (NOT the global
+#       `systemctl is-system-running` - which is "starting" while the
+#       gate's own boot job is queued, so a global running check could
+#       never pass inside its own boot - D3.)
+#   (2) the edge listening + reachable on 443;
+#   (3) sshd listening + reachable on 22 (FR-003/FR-018 - a plain curl
+#       against the edge can pass before sshd is up);
+#   (4) [T019] when SITE_ACTIVE=1: `omd status <site>` rc 0 AND HTTPS
+#       https://127.0.0.1/<site>/ through the edge 302/200 AND the
+#       enabled-component listeners.
+# Success => exit 0 (the gate stays "active (exited)" via
+# RemainAfterExit - the documented readiness signal:
+# `systemctl is-active omd-ready`).
+#
+# The single-authority fatal transition (D3) - on failure, ordered before
+# this process exits:
+#   (i)   write /var/log/omd-labs/fatal-reason - the exit-surviving reason
+#         channel (B3): writable layer (NOT /run - volatile post-boot),
+#         <=16 KiB, written+closed before the pipe copy; a write failure
+#         degrades (logged), never changes the exit code;
+#   (ii)  write /run/omd-ready-rc (operator-inspectable artifact);
+#   (iii) log READY-FATAL: <condition> (journal);
+#   (iv)  bounded cleanup: timeout 5 /usr/local/bin/omd-site-stop (rc
+#         ignored; a no-op while SITE_ACTIVE=0 - the guarded wrapper must
+#         never be called with an empty site name, D8);
+#   (v)   the FATAL-BLOCK (marker + journal tail, ~15 lines) to the
+#         journal;
+#   (vi)  the direct copy of the fatal material to the container log pipe
+#         - deadline-bounded (B4): /proc/$(cat /run/fwd.pid)/fd/1 opened
+#         O_WRONLY|O_NONBLOCK, the one-line reason FIRST, then the block in
+#         chunks under a 5 s wall-clock deadline (a size-bounded sync write
+#         is NOT sufficient - a pipe write can block indefinitely on a full
+#         pipe); failure policy = degrade, never block, never change the
+#         exit code (DIRECT-COPY: status=<n>);
+#   (vii) sleep 1 (flush margin for the forwarder's journal stream);
+#   (viii) exit 1 (a readiness condition failed) / exit 2 (deadline).
+#
+# The container exit fires only via omd-ready's [Unit] FailureAction=exit
+# (no FailureActionExitStatus) - systemd executes it only AFTER this
+# process has fully exited, so (i)-(vii) complete before the container
+# stops. NOTE: no `set -e` - the probe manages its own control flow; an
+# intermediate failing command must never abort the fatal machinery.
+set -uo pipefail
+
+GATE_WINDOW=120
+T0=$SECONDS
+
+# env (D9 primary channel - written by omd-labs-entry)
+SITE_ACTIVE=0 SITE_NAME=""
+if [ -r /run/omd-labs.env ]; then
+    set -a; . /run/omd-labs.env; set +a
+fi
+
+# the distro edge unit (research.md D8 - per-distro names)
+EDGE=httpd.service
+SSH_UNIT=sshd.service
+if [ -r /etc/os-release ]; then
+    . /etc/os-release 2>/dev/null || true
+    case "${ID:-}" in
+        debian) EDGE=apache2.service; SSH_UNIT=ssh.service ;;
+    esac
+fi
+EDGE_NAME=${EDGE%.service}
+
+# --- helpers -----------------------------------------------------------------
+listening() { # listening <port> - ss view
+    ss -ltn 2>/dev/null | grep -qE "[:.]${1} "
+}
+
+tcp_open() { # tcp_open <port> - in-container TCP connect
+    timeout 3 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null
+}
+
+# per-unit state: rc 0 = active; rc 2 = transient (wait); rc 3 = failed (fatal)
+unit_state() { # unit_state <unit>
+    local u=$1 state result
+    state=$(systemctl show -p ActiveState --value "$u" 2>/dev/null || echo unknown)
+    result=$(systemctl show -p Result --value "$u" 2>/dev/null || echo ok)
+    case "$state" in
+        active) return 0 ;;
+        activating|activating-auto|reloading) return 2 ;;
+        failed) return 3 ;;
+        *)
+            if [ "$result" = "failed" ]; then return 3; fi
+            return 2 ;;  # inactive/unknown: transient until the deadline
+    esac
+}
+
+# (4) the site-active conditions (T019 - contracts/readiness-and-failures.md
+# "Ready"): `omd status ${SITE_NAME}` rc 0 (all site daemons running - the
+# AUTHORITATIVE daemon-state signal in this OMD generation), the site UI
+# reachable over HTTPS at /<site> through the edge (302/200 - the OMD login
+# redirect), and the enabled-component LISTENERS up. The enabled components
+# are read from the STORED site configuration (etc/omd/site.conf, CONFIG_*
+# format - the authoritative applied state; the effective-customization
+# summary is the log's job, not the probe's):
+#   CONFIG_ALERTMANAGER=on      -> CONFIG_ALERTMANAGER_TCP_PORT (127.0.0.1:9093)
+#   CONFIG_BLACKBOX_EXPORTER=on -> CONFIG_BLACKBOX_EXPORTER_TCP_PORT (127.0.0.1:9115)
+#   CONFIG_GRAFANA=on           -> CONFIG_GRAFANA_TCP_PORT (8003)
+#   CONFIG_INFLUXDB=on          -> CONFIG_INFLUXDB_HTTP_TCP_PORT (127.0.0.1:8086)
+# GEARMAND/4730 is EXCLUDED from the listener list (EMPIRICAL 2026-11-10,
+# rationale CORRECTED 2026-11-11 per codex 99): there IS a standalone
+# gearmand daemon (bin/gearmand) that listens on 4730 - but ONLY when BOTH
+# MOD_GEARMAN=on AND GEARMAND=on (the init script's DEPENDS requires both;
+# CONFIG_GEARMAND defaults to 'on' but CONFIG_MOD_GEARMAN defaults to 'off',
+# so a DEFAULT site never starts the daemon and never opens 4730). The gate
+# cannot assert the simple "GEARMAND=on => 4730" mapping the other keys use,
+# because GEARMAND is on by default while the daemon needs the MOD_GEARMAN
+# pair - a fresh default site therefore has no 4730 listener yet `omd status`
+# reports rc 0, and asserting 4730 on the default GEARMAND=on stalled the
+# gate the full 120 s [EMPIRICAL: healthy site, omd status rc 0, UI 302,
+# ss -ltn :4730 empty for 120 s; and a MOD_GEARMAN=on site DOES run the
+# daemon and listens on 4730, EMPIRICAL 2026-11-11]. Asserting the 4730
+# listener once MOD_GEARMAN is customized on is a tracked follow-up (tasks
+# Phase 9/10), not changed here to avoid a gate behavior change without
+# re-verification. (naemon/rrdcached/npcd/crontab have no default listeners -
+# `omd status` covers them; the site's own loopback apache backend is covered
+# by the /<site> HTTPS check through the edge.)
+check_site() {
+    local site=$1 conf code
+    conf=/omd/sites/${site}/etc/omd/site.conf
+    # (a) the site daemons (omd status exits 0 with all daemons running;
+    #     its rc is the daemon-state signal - transient wait, never fatal:
+    #     the per-unit omd-site state is the fatal layer)
+    if ! omd status "${site}" >/dev/null 2>&1; then
+        return 1
+    fi
+    # (b) the site UI over HTTPS through the edge (302 = the login redirect,
+    #     200 acceptable)
+    # no `|| echo 000` fallback: curl prints 000 itself on a failed
+    # connection; the fallback would make the value "000000" (masked here by
+    # the exact-match case, but wrong - see verify/common.sh v_http_alive)
+    code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+        "https://127.0.0.1/${site}/" 2>/dev/null)
+    case "$code" in 302|200) ;; *) return 1;; esac
+    # (c) the enabled-component listeners (from the stored site.conf);
+    # GEARMAND intentionally not asserted - mod_gearman runs in-process
+    # (see the (4) comment above); the default-on GEARMAND would otherwise
+    # stall the gate on the absent 4730 listener
+    [ -r "$conf" ] || return 0   # conf unreadable: (a)+(b) already passed
+    local key val
+    for key in ALERTMANAGER BLACKBOX_EXPORTER GRAFANA INFLUXDB; do
+        val=$(sed -n "s/^CONFIG_${key}='\(.*\)'/\1/p" "$conf" | head -n 1)
+        [ "$val" = "on" ] || continue
+        case "$key" in
+            ALERTMANAGER)      val=$(sed -n "s/^CONFIG_ALERTMANAGER_TCP_PORT='\(.*\)'/\1/p" "$conf" | head -n 1) ;;
+            BLACKBOX_EXPORTER) val=$(sed -n "s/^CONFIG_BLACKBOX_EXPORTER_TCP_PORT='\(.*\)'/\1/p" "$conf" | head -n 1) ;;
+            GRAFANA)           val=$(sed -n "s/^CONFIG_GRAFANA_TCP_PORT='\(.*\)'/\1/p" "$conf" | head -n 1); val=${val:-8003} ;;
+            INFLUXDB)          val=$(sed -n "s/^CONFIG_INFLUXDB_HTTP_TCP_PORT='\(.*\)'/\1/p" "$conf" | head -n 1) ;;
+        esac
+        # port = the value (port-only keys) or its :port part (addr:port keys);
+        # an unparseable value is skipped ((a)+(b) still gate the site)
+        local port
+        case "$val" in *:*) port=${val##*:} ;; *) port=$val ;; esac
+        case "$port" in ''|*[!0-9]*) continue;; esac
+        # the component listens on its configured address (loopback or any)
+        if ! ss -ltn 2>/dev/null | grep -qE "[:.]${port} "; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# (vi) the direct, deadline-bounded copy to the container log pipe (B4).
+# DIRECT-COPY status codes: 0=complete 1=EAGAIN/partial 2=write deadline
+# 4=forwarder dead 5=no pid file 6=open error. Degrade, never block, never
+# change the exit code.
+direct_copy() { # direct_copy <reason> <blockfile>
+    local fwdpid
+    fwdpid=$(cat /run/fwd.pid 2>/dev/null) || {
+        echo "DIRECT-COPY: status=5 (no /run/fwd.pid - pipe copy skipped)"; return 0; }
+    kill -0 "$fwdpid" 2>/dev/null || {
+        echo "DIRECT-COPY: status=4 (forwarder dead - pipe copy skipped)"; return 0; }
+    FWD_PID="$fwdpid" python3 - "$1" "$2" <<'PYEOF' 2>/dev/null || true
+import os, sys, time
+fwd, reason, blockfile = os.environ["FWD_PID"], sys.argv[1], sys.argv[2]
+try:
+    fd = os.open("/proc/%s/fd/1" % fwd, os.O_WRONLY | os.O_NONBLOCK)
+except OSError as e:
+    print("DIRECT-COPY: status=6 (open error: %s)" % e)
+    sys.exit(0)
+status = 0
+try:
+    with open(blockfile, "rb") as f:
+        block = f.read()
+    deadline = time.monotonic() + 5.0
+    def send(data):
+        global status
+        while data:
+            if time.monotonic() >= deadline:
+                status = 2
+                return
+            try:
+                n = os.write(fd, data)
+            except OSError:
+                status = 1
+                return
+            data = data[n:]
+    send(reason.encode() + b"\n")      # the one-line reason goes FIRST
+    if status == 0:
+        send(block)
+    why = {0: "sent", 1: "partial", 2: "deadline"}.get(status, "?")
+    print("DIRECT-COPY: status=%d (reason=%s)" % (status, why))
+finally:
+    os.close(fd)
+PYEOF
+    return 0
+}
+
+# (i)-(viii) the fatal transition - single authority, ordered before exit.
+fatal() { # fatal <rc> <condition>
+    local rc=$1 condition=$2
+    local reason="READY-FATAL: ${condition} (rc=${rc})"
+
+    # (i) the bounded fatal-reason file - the exit-surviving reason channel
+    mkdir -p /var/log/omd-labs 2>/dev/null || true
+    chmod 0755 /var/log/omd-labs 2>/dev/null || true
+    {
+        printf '%s\n' "$reason"
+        journalctl -u omd-ready -u omd-site -u "$EDGE" --no-pager -o short-iso 2>/dev/null | tail -n 15
+    } > /var/log/omd-labs/fatal-reason 2>/dev/null || true
+    if [ ! -s /var/log/omd-labs/fatal-reason ]; then
+        echo "FATAL-REASON: write failed - degraded (the exit code is the guaranteed artifact)"
+    else
+        # enforce the 16 KiB bound (reason line only if the tail made it bigger)
+        local sz
+        sz=$(stat -c %s /var/log/omd-labs/fatal-reason 2>/dev/null || echo 0)
+        if [ "$sz" -gt 16384 ]; then
+            printf '%s\n' "$reason" > /var/log/omd-labs/fatal-reason 2>/dev/null || true
+        fi
+        chmod 0644 /var/log/omd-labs/fatal-reason 2>/dev/null || true
+        chown root:root /var/log/omd-labs/fatal-reason 2>/dev/null || true
+    fi
+
+    # (ii) the operator-inspectable rc artifact
+    echo "$rc" > /run/omd-ready-rc 2>/dev/null || true
+
+    # (iii) the reason to the journal
+    echo "$reason"
+
+    # (iv) bounded cleanup via the guarded stop wrapper (rc ignored - a
+    #      no-op while SITE_ACTIVE=0). (M2, codex 99) -k 1 escalation: a
+    #      TERM-ignoring child of the stop wrapper cannot hold the probe past
+    #      deadline+grace (the unit backstop is the last resort, but the
+    #      escalation bounds the common case).
+    timeout -k 1 5 /usr/local/bin/omd-site-stop >/dev/null 2>&1 || true
+
+    # (v) the FATAL-BLOCK to the journal
+    echo "FATAL-BLOCK-BEGIN (omd-ready rc=${rc}, condition: ${condition})"
+    journalctl -u omd-ready -u omd-site -u "$EDGE" --no-pager -o short-iso 2>/dev/null | tail -n 15
+    echo "FATAL-BLOCK-END"
+
+    # (vi) the direct copy - reason first, 5 s wall-clock deadline
+    local blockfile
+    blockfile=$(mktemp)
+    {
+        echo "FATAL-BLOCK-BEGIN (omd-ready rc=${rc}, condition: ${condition})"
+        journalctl -u omd-ready -u omd-site -u "$EDGE" --no-pager -o short-iso 2>/dev/null | tail -n 15
+        echo "FATAL-BLOCK-END"
+    } > "$blockfile"
+    direct_copy "$reason" "$blockfile"
+    rm -f "$blockfile"
+
+    # (vii) flush margin for the forwarder's journal stream
+    sleep 1
+
+    # (viii)
+    exit "$rc"
+}
+
+# --- the polling loop (deadline = the gate window) ----------------------------
+while :; do
+    if [ $(( SECONDS - T0 )) -ge "$GATE_WINDOW" ]; then
+        fatal 2 "readiness deadline exceeded (${GATE_WINDOW}s gate window)"
+    fi
+
+    # (1) per-unit states: failed => fatal rc 1; transient/inactive => wait.
+    # (M6, codex 99) every required unit must reach ACTIVE (rc 0) before the
+    # listener checks run: the old form fatal'd only on rc 3 and let rc 2
+    # (activating/inactive/unknown) fall through, so an inactive/masked unit
+    # could be declared ready merely because its socket happened to answer.
+    # rc 2 now waits (sleep + continue); a unit that stays non-active until
+    # the deadline is a fatal 2, not a false READY. (unit_ok is a plain
+    # global here: the polling loop is top-level code, not a function -
+    # `local` outside a function is a bash error and, under the script's
+    # `set -u`, aborts the probe.)
+    unit_ok=1
+    for u in omd-site.service "$EDGE" "$SSH_UNIT"; do
+        unit_state "$u"
+        case $? in
+            3) fatal 1 "unit ${u} failed (per-unit ActiveState/Result=failed)" ;;
+            2) unit_ok=0 ;;
+        esac
+    done
+    [ "$unit_ok" = 1 ] || { sleep 2; continue; }
+
+    # (2) the edge 443
+    if ! listening 443 || ! tcp_open 443; then
+        sleep 2; continue
+    fi
+
+    # (3) sshd 22
+    if ! listening 22 || ! tcp_open 22; then
+        sleep 2; continue
+    fi
+
+    # (4) the site-active conditions (T019)
+    if [ "$SITE_ACTIVE" = "1" ] && ! check_site "$SITE_NAME"; then
+        sleep 2; continue
+    fi
+
+    echo "READY: base services up (omd-site active, ${EDGE_NAME} 443, sshd 22)"
+    exit 0
+done

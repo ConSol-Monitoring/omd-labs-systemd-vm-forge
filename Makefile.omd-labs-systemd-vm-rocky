@@ -1,0 +1,3 @@
+DISTRO=rocky
+
+include Makefile.common

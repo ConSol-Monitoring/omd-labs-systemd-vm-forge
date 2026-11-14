@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# omd-labs-forwarder - the orphaned container-log forwarder (research.md C5, D3).
+#
+# Spawned by omd-labs-entry as a background (orphaned) child BEFORE
+# `exec /sbin/init`. It inherits the entry's stdout = the container log
+# pipe as fd 1, which is the ONLY writable handle to that pipe after
+# systemd reopens its own stdio to /dev/null (C5).
+#
+# It does exactly one thing: replay the boot journal (--lines=all is
+# MANDATORY - plain -f replays only the last 10 lines and would miss the
+# site-start transcript [EMPIRICAL]) and follow it live into the
+# container log.
+#
+# PURE LOGGER (D3 single-authority rule): no polling, no `omd stop`, no
+# exit path. Its death degrades only the log channel - never the exit
+# path. omd-labs-entry records this process's PID in /run/fwd.pid (the
+# probe's direct-copy target - D3 step 6).
+set -uo pipefail
+# The journal storage (/run/log/journal, or /var/log/journal) is created by
+# systemd's journald a few seconds after PID 1 starts - this process is
+# spawned BEFORE `exec /sbin/init`, so wait (bounded) for a boot journal to
+# exist, then replay + follow. (journalctl -f dies immediately when no
+# journal files exist yet - that would kill the log channel at boot.)
+t=0
+until journalctl -b -o short-iso --no-pager -n 1 >/dev/null 2>&1; do
+    t=$((t + 1))
+    if [ "$t" -ge 60 ]; then
+        echo "omd-labs-forwarder: no boot journal within 60s - log channel degraded" >&2
+        break
+    fi
+    sleep 1
+done
+exec /usr/bin/journalctl -b -f -o short-iso --no-pager --lines=all
