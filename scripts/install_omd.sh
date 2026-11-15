@@ -48,7 +48,11 @@ function install_omd_rocky() {
   PACKAGENAME=`pkgName $VERSION`
   REPOVERSION=`repoVersion $VERSION`
 
-  rpm -Uvh "https://labs.consol.de/repo/${REPOVERSION}/rhel9/x86_64/labs-consol-${REPOVERSION}.rhel9.noarch.rpm"
+  # --replacepkgs: Stage 2 base images already carry the lab channel repo(s),
+  # so this can be a same-version reinstall, which plain `rpm -Uvh` rejects
+  # ("package ... is already installed"). Same version -> no-op reinstall;
+  # a newer repo rpm -> normal upgrade. Fresh installs are unaffected.
+  rpm -Uvh --replacepkgs "https://labs.consol.de/repo/${REPOVERSION}/rhel9/x86_64/labs-consol-${REPOVERSION}.rhel9.noarch.rpm"
   yum update
   yum -y install $PACKAGENAME
   test -f /usr/bin/ping && chmod +s /usr/bin/ping

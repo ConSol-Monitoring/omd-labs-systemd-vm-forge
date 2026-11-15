@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       omd_version:
-        description: 'OMD package version to build against: master (daily/testing), latest (stable), or e.g. 5.81 (versioned stable)'
+        description: 'OMD package version to build against: master (daily/testing), latest (stable), or e.g. 5.80 (versioned stable; even minors only)'
         type: string
         required: false
         default: master
@@ -53,7 +53,7 @@ jobs:
 
       # branch -> OMD package version (install_omd.sh mapping):
       # master -> master (daily/testing), latest -> latest (stable),
-      # v5.81  -> 5.81 (versioned stable)
+      # v5.80  -> 5.80 (versioned stable; only even minors are stable)
       - name: Resolve OMD version
         id: resolve
         run: |
@@ -73,10 +73,15 @@ jobs:
         uses: mxschmitt/action-tmate@v3
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
 
-      # test build only: no registry login, no push
+      # test build only: no registry login, no push.
+      # context: . pins the build to THIS checkout (A1 hardening): without it
+      # buildx defaults to the trigger event's git ref, so a pull_request would
+      # build the merge ref's files instead of the PR head's (the PR's own
+      # Dockerfile/scripts edits would not be the ones tested).
       - name: Build (no push)
         uses: docker/build-push-action@v7
         with:
+          context: .
           push: false
           file: Dockerfile.omd-labs-systemd-vm-${{ matrix.os }}
           sbom: false

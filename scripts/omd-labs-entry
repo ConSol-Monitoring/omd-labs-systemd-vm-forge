@@ -1055,6 +1055,19 @@ if [ -d /sys/fs/cgroup ] && [ ! -w /sys/fs/cgroup ]; then
 fi
 
 if [ -n "${SITENAME:-}" ]; then
+    # (Stage 2, base image) the OMD package MUST be present before ANY site
+    # filesystem mutation: the site bootstrap needs the OMD group + the
+    # Apache user (omd group absent on the OMD-less base image), and without
+    # the check a bad SITENAME boot left a PARTIAL /omd/sites/<name> behind
+    # before dying (EMPIRICAL 2026-11-14 probe: useradd 'group omd does not
+    # exist'). Constant-path test - the wrappers' actual executable is
+    # /usr/bin/omd (omd-site-start: exec /usr/bin/omd), NOT a PATH lookup
+    # (`command -v omd` could be fooled by another program). This runs
+    # BEFORE site_resolve (no filesystem mutation either way) and before
+    # site_mount (mutation starts at SITE_DIR creation) - the no-site path
+    # is untouched, and the OMD image passes this trivially (same scripts
+    # in both images - Stage 2 decision 4).
+    [ -x /usr/bin/omd ] || fatal "FATAL: OMD is not installed in this image (the base image is chassis-only). Install an OMD package first - the labs.consol.de repositories are already configured (dnf install omd-labs-edition / apt-get install omd-labs-edition, or omd-<ver>-labs-edition / omd-labs-edition-daily) - then re-run with SITENAME."
     # CRITICAL: the site path + validation use SITE_NAME (the RESOLVED value);
     # it must be taken from the runtime SITENAME before site_resolve validates
     SITE_NAME="${SITENAME}"

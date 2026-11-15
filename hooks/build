@@ -1,8 +1,12 @@
 #!/bin/bash
 # This hook
 # - exposes the SOURCE_BRANCH as OMD_VERSION to the build process
+# - selects the build stage from FLAVOR (omd = the default/final stage,
+#   base = the OMD-less chassis stage)
 # - uses $DOCKER_REPO to access the OS Dockerfile
-# https://docs.docker.com/docker-cloud/builds/advanced/
+# https://docs.docker.com/docker-cloud-builds/advanced/
+# (Docker Hub's legacy hook invocation has no FLAVOR: it defaults to the
+# OMD stage, as before. FLAVOR=base builds the chassis stage instead.)
 
 env | sort
 
@@ -10,5 +14,10 @@ env | sort
 # index.docker.io/consol/omd-labs-rocky  (segment 3 keeps the 'omd-labs-' prefix)
 # the Dockerfile in this repo is Dockerfile.omd-labs-systemd-vm-<distro> -
 # strip the 'omd-labs-' prefix before composing the file name.
-DOCKERFILE=Dockerfile.omd-labs-systemd-vm-$(echo $DOCKER_REPO | cut -d "/" -f 3 | sed 's/^omd-labs-//')
-docker build -f $DOCKERFILE -t $IMAGE_NAME --build-arg OMD_VERSION=$(echo ${SOURCE_BRANCH} | sed 's/v//') $@ .
+DOCKERFILE=Dockerfile.omd-labs-systemd-vm-$(echo $DOCKER_REPO | cut -d "/" -f3 | sed 's/^omd-labs-//')
+# the build stage: FLAVOR=base builds the OMD-less chassis stage; omd (default)
+# builds the `omd` stage (whose `FROM base` stage is built first, same checkout).
+TARGET=${FLAVOR:-omd}
+docker build -f "$DOCKERFILE" --target "$TARGET" -t "$IMAGE_NAME" \
+  --build-arg OMD_VERSION=$(echo ${SOURCE_BRANCH} | sed 's/v//') \
+  "$@" .

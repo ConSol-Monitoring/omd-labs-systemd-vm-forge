@@ -4,6 +4,19 @@
 # others to "local/[dirname]:[branchname]"
 # the build hook (hooks/build) derives the Dockerfile name from DOCKER_REPO:
 # Dockerfile.omd-labs-systemd-vm-<distro>
+#
+# FLAVOR selects the image target (Stage 2, base image):
+#   omd   (default) - the OMD-preinstalled image (Dockerfile's final/`omd`
+#                     stage) - the existing behavior, no new flags for
+#                     existing users.
+#   base  - the OMD-less chassis image (Dockerfile's `base` stage):
+#           local/omd-labs-systemd-vm-base-<distro>:<TAG>, no OMD package,
+#           both labs.consol.de repos configured, no site (SITENAME must be
+#           empty; the entry fails fast if a site is requested without OMD).
+#
+# The OMD image is `FROM base AS omd` inside the same Dockerfile, so an OMD
+# build always derives from the same-checkout base stage (built in the same
+# invocation, cache-reused); no external base reference is involved.
 
 ifeq ($(strip $(DISTRO)),)
     $(error DISTRO must not be empty, use Makefile.omd-labs-* instead)
@@ -11,19 +24,43 @@ endif
 
 LOCAL_HTTPS_PORT ?= 8443
 
+FLAVOR ?= omd
+ifneq ($(FLAVOR),omd)
+ifneq ($(FLAVOR),base)
+    $(error FLAVOR must be omd (default) or base, got '$(FLAVOR)')
+endif
+endif
+
 # local builds will be named like this
-REPO = local/omd-labs-systemd-vm-$(DISTRO)
+ifeq ($(FLAVOR),base)
+    REPO = local/omd-labs-systemd-vm-base-$(DISTRO)
+else
+    REPO = local/omd-labs-systemd-vm-$(DISTRO)
+endif
 BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
 # BRANCH=TAG, but "master"="nightly"
 TAG  = $(shell git rev-parse --abbrev-ref HEAD | sed 's/master/nightly/')
 # the final image name
 IMAGE=$(REPO):$(TAG)
 
+# NOTE: no BASE_REF. The OMD image is `FROM base AS omd` INSIDE the same
+# Dockerfile, so an OMD build always derives from the same-checkout base stage
+# (built in the same invocation, cache-reused) - it never consumes a separate
+# published/local base image. The FLAVOR flag is the only selector:
+#   FLAVOR=base -> --target base (the chassis)
+#   FLAVOR=omd  (default) -> the `omd` stage (the base stage is built first)
+
 # v2: SITENAME is a RUNTIME variable — the container selects the site at
 # start (empty/absent = no site, base services only). The `?=` demo default
 # is a command-line convenience, NOT an image default (the image no longer
 # bakes a site in — the build-time site block is retired).
-SITENAME ?= demo
+# The base image has NO OMD: a site request fails fast, so the base flavor
+# defaults to no site.
+ifeq ($(FLAVOR),base)
+    SITENAME ?=
+else
+    SITENAME ?= demo
+endif
 
 # the container runtime. The documented invocation is `--privileged`
 # (+ `--systemd=always` on podman — its wrapper CMD does not match the
@@ -43,6 +80,15 @@ SELABEL ?= $(shell getenforce 2>/dev/null | grep -qx Enforcing && printf ':z')
 export DOCKER_REPO=index.docker.io/consol/omd-labs-$(DISTRO)
 export IMAGE_NAME=$(IMAGE)
 export SOURCE_BRANCH=$(BRANCH)
+export FLAVOR
+
+# the build stage selected from FLAVOR (hooks/build passes --target):
+# omd -> the final/default stage; base -> the chassis stage
+ifeq ($(FLAVOR),base)
+  BUILD_TARGET=base
+else
+  BUILD_TARGET=omd
+endif
 
 .PHONY: build start startvol stop echo
 
