@@ -38,15 +38,24 @@ readonly EXIT_FATAL=1           # fatal pre-ready failure
 readonly EXIT_DEADLINE=2        # readiness deadline exceeded
 readonly EXIT_KILL=137          # SIGKILL after stop timeout - the only stop-failure outcome
 
-# ---- image / tag resolution (Makefile.common lines 14-16) --------------------
+# ---- image / tag resolution (Makefile.common: FLAVOR -> REPO) ---------------
+# Naming-drift fix (Stage 2, consensus B7): the suite must select the SAME
+# image name the Makefile builds (local/omd-labs-systemd-vm-*). The old
+# short name (local/omd-labs-<distro>) silently ran a STALE/WRONG image when
+# one happened to exist. v_image = the OMD image; v_base_image = the
+# OMD-less chassis (base flavor).
 v_tag() {
     local branch
     branch=$(git rev-parse --abbrev-ref HEAD)
     [ "$branch" = "master" ] && echo nightly || echo "$branch"
 }
 
-v_image() { # v_image <distro> [tag]
-    echo "local/omd-labs-$1:${2:-$(v_tag)}"
+v_image() { # v_image <distro> [tag]  - the OMD-preinstalled image
+    echo "local/omd-labs-systemd-vm-$1:${2:-$(v_tag)}"
+}
+
+v_base_image() { # v_base_image <distro> [tag]  - the OMD-less chassis image
+    echo "local/omd-labs-systemd-vm-base-$1:${2:-$(v_tag)}"
 }
 
 # ---- port allocation (one unique port per scenario, 18451..18461) ------------
@@ -65,6 +74,12 @@ v_port() { # v_port <scenario> [slot]
         s7)   p=18461;;
         s8)   p=18460;;
         s10)  p=18449;;
+        # Stage 2 base-image scenarios (B6). Reuse freed ports - scenario runs
+        # are NEVER concurrent (one per invocation), so reuse is safe (as
+        # s2/s3 reuse 18453, s6d/s8 reuse 18460).
+        s11a)  p=18451;;    # base no-site boot (reuse s1)
+        s11ff) p=18451;;    # base + SITENAME fail-fast (reuse s1, separate run)
+        s11b)  p=18457;;    # base runtime-install smoke (reuse s4)
         *) return 1;;
     esac
     (( p >= 18449 && p <= 18461 )) || { echo "v_port: $p out of range" >&2; return 1; }

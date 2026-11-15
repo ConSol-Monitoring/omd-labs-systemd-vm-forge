@@ -3,8 +3,10 @@
 # The OMD build pipeline (ConSol intranet) posts a repository_dispatch after
 # publishing an OMD package:
 #
-#   curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+#   curl -s --fail-with-body -X POST \
+#     -H "Authorization: token $GITHUB_TOKEN" \
 #     -H "Accept: application/vnd.github+json" \
+#     -H "Content-Type: application/json" \
 #     https://api.github.com/repos/ConSol-Monitoring/omd-labs-systemd-vm-forge/dispatches \
 #     -d '{"event_type":"omd-published","client_payload":{"omd_version":"master"}}'
 #
@@ -13,10 +15,58 @@
 #   latest -> omd-labs-edition        from the stable repo  -> tag latest
 #   5.81   -> omd-5.81-labs-edition   from the stable repo  -> tag v5.81
 #
-# The build checks out the matching ref (master / latest / v5.81) so the
-# repository content matches the OMD package. A manual workflow_dispatch
-# with the same input is the fallback (e.g. for a republish).
+# Operational contract (2026-11-14 spar round, 99-consensus.md A5):
+#   - the refs master / latest / v<maj>.<min> must exist in this repository
+#     (the build checks out the matching ref so the chassis matches the OMD
+#     package); the workflow files themselves must exist on the DEFAULT
+#     branch (a repository_dispatch always runs the default-branch copy of
+#     the workflow). The BUILD content, however, is the resolved ref's,
+#     because every build step pins `context: .` to that checkout (A1);
+#   - the caller's token only needs to be authorized for THIS repository
+#     (the dispatch API does not grant registry access);
+#   - HTTP 204 = the event was ACCEPTED, not published. A failed build shows
+#     up in the Actions run, not in the HTTP response (use `--fail-with-body`);
+#   - duplicates: repeated mutable-channel POSTs (master/latest) are harmless
+#     rebuild requests (coalesced by the concurrency group); repeated
+#     immutable-channel POSTs (v*) are no-ops when the release already exists
+#     (v* no-overwrite, below);
+#   - "latest" means the newest stable package available when the install
+#     runs - it does not pin the package that caused the POST. The exact
+#     installed package is logged per architecture by the build job.
+#
+# BOTH images are published from one checkout (Stage 2, decision 4):
+#   omd-labs-systemd-vm-base-<os>  - the OMD-less chassis (Dockerfile `base`
+#                                    stage). It moves with the OMD runs on
+#                                    purpose: the OMD image is built FROM the
+#                                    same-checkout base stage, so the
+#                                    published base tag always matches the
+#                                    chassis the OMD image actually uses.
+#   omd-labs-systemd-vm-<os>       - the OMD-preinstalled image (Dockerfile
+#                                    `omd` stage, the Dockerfile default).
+#
+# Tag scheme (ratified): nightly/latest mutable; v<maj>.<min> IMMUTABLE - a
+# v* run whose artifacts already exist in GHCR is a no-op (it never
+# rebuilds and overwrites a published release). A partially completed release
+# is RESUMED: existing artifacts are skipped, missing ones are built, and the
+# manifest is reassembled from the run's arch layers + the retained ones.
+# -amd64/-arm64 are the architecture layers behind each multi-arch tag.
+#
+# Publication is serialized across ALL publishers (this workflow AND
+# release.yml) by ONE shared workflow-level concurrency group (A2): no two
+# publication runs overlap, so mutable arch tags cannot be mixed between runs
+# and the v*/:latest checks are race-free. cancel-in-progress: false (runs
+# are never cancelled). Default (single-slot) pending coalescing is accepted
+# for this webhook-driven load; a second pending run replaces the first.
+
 name: Publish (OMD webhook)
+
+concurrency:
+  # SHARED publication lock - the SAME constant group in release.yml. A
+  # constant (version-independent) key is required: it must serialize ANY two
+  # publication runs across both workflows (version-specific keys would let
+  # different versions publish in parallel and race the mutable arch tags).
+  group: omd-labs-publication
+  cancel-in-progress: false
 
 on:
   repository_dispatch:
@@ -42,18 +92,53 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      # `packages: read` for the in-resolve v* guard step (step g): an
+      # explicit job-level `permissions:` block zeroes every permission not
+      # listed, and the guard's authenticated GHCR existence check needs a
+      # read scope (distribution token exchange + manifest HEADs).
+      packages: read
     outputs:
       omd: ${{ steps.r.outputs.omd }}
       ref: ${{ steps.r.outputs.ref }}
       tag: ${{ steps.r.outputs.tag }}
+      commit: ${{ steps.c.outputs.commit }}
+      # v* guard results (step g). EMPTY for mutable tags (step skipped) -
+      # every consumer treats empty as "build", i.e. the fail-safe
+      # direction (worst case: a rebuild, never a silent skip).
+      arch_omd_rocky_amd64:  ${{ steps.g.outputs.arch_omd_rocky_amd64 }}
+      arch_omd_rocky_arm64:  ${{ steps.g.outputs.arch_omd_rocky_arm64 }}
+      arch_omd_debian_amd64: ${{ steps.g.outputs.arch_omd_debian_amd64 }}
+      arch_omd_debian_arm64: ${{ steps.g.outputs.arch_omd_debian_arm64 }}
+      arch_base_rocky_amd64: ${{ steps.g.outputs.arch_base_rocky_amd64 }}
+      arch_base_rocky_arm64: ${{ steps.g.outputs.arch_base_rocky_arm64 }}
+      arch_base_debian_amd64: ${{ steps.g.outputs.arch_base_debian_amd64 }}
+      arch_base_debian_arm64: ${{ steps.g.outputs.arch_base_debian_arm64 }}
+      idx_omd_rocky:   ${{ steps.g.outputs.idx_omd_rocky }}
+      idx_omd_debian:  ${{ steps.g.outputs.idx_omd_debian }}
+      idx_base_rocky:  ${{ steps.g.outputs.idx_base_rocky }}
+      idx_base_debian: ${{ steps.g.outputs.idx_base_debian }}
+      all_exist:       ${{ steps.g.outputs.all_exist }}
     steps:
       - name: Resolve
         id: r
         run: |
+          set -euo pipefail
           omd="$INPUT_OMD"
+          # strict input validation (S1/A5): reject missing/empty, v-prefixed,
+          # malformed or control-character values with a NAMED cause, instead
+          # of letting them become a bogus ref that fails later at checkout.
           case "$omd" in
+            "") echo "::error::empty omd_version - expected master, latest, or a bare version like 5.81"; exit 1;;
             master|latest) ref=$omd;;
-            *) ref=v${omd};;
+            *)
+              if printf '%s' "$omd" | grep -qP '[\x00-\x1f]'; then
+                echo "::error::omd_version contains control characters"; exit 1
+              fi
+              if [[ ! "$omd" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                echo "::error::invalid omd_version '$omd' - expected master, latest, or a bare version like 5.81 (no 'v' prefix, no branch name)"
+                exit 1
+              fi
+              ref=v${omd};;
           esac
           case "$omd" in
             master) tag=nightly;;
@@ -64,6 +149,158 @@ jobs:
           echo "ref=$ref"  >> "$GITHUB_OUTPUT"
           echo "tag=$tag"  >> "$GITHUB_OUTPUT"
           echo "::notice title=Publish::OMD package $omd, checkout ref $ref, image tag $tag"
+
+      # the build content is ALWAYS this checkout (not the event's git context
+      # - A1). The workflow runs the default-branch copy (dispatch semantics);
+      # the checked-out code is the resolved ref.
+      - name: Check the ref exists (named failure)
+        run: |
+          # Without this, an unknown ref (e.g. a dispatch for a version whose
+          # v<maj>.<min> branch was never created) dies in actions/checkout
+          # with a raw `git fetch` error and the ref is only visible buried in
+          # the fetch refspec. Contract (publish.yml header): the refs
+          # master / latest / v<maj>.<min> must exist before a dispatch.
+          # Public repo: anonymous ls-remote, no secrets needed.
+          # NOTE: the full repo URL, NOT the `origin` remote - this step runs
+          # BEFORE actions/checkout, where there is no repo and no remote yet
+          # (a bare `origin` fails here for EVERY ref).
+          # Exact patterns (no prefix wildcard: a `refs/heads/<ref>*` match
+          # would let e.g. `latest-backup` pass a check for `latest`), and a
+          # lookup FAILURE (network etc.) is reported as such instead of as
+          # "does not exist".
+          set -euo pipefail
+          repo=https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge.git
+          out=$(git ls-remote --exit-code "$repo" \
+                "refs/heads/${{ steps.r.outputs.ref }}" "refs/tags/${{ steps.r.outputs.ref }}") || {
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::ref ${{ steps.r.outputs.ref }} does not exist (checked branch + tag, exact match) - the publish contract requires the ref to exist first (see the workflow header); create it, e.g. \`git push origin <commit>:refs/heads/${{ steps.r.outputs.ref }}\`"
+            else
+              echo "::error::could not LIST refs of $repo (git ls-remote rc=$rc) - lookup failure, NOT a missing-ref verdict"
+            fi
+            exit 1
+          }
+          echo "::notice title=Publish::ref ${{ steps.r.outputs.ref }} exists - proceeding"
+
+      - name: Check out the repo (matching ref)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.r.outputs.ref }}
+
+      # A1: one resolved commit for the WHOLE matrix; recorded as a label on
+      # every built image so the source revision is auditable.
+      - name: Record the source revision
+        id: c
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Publish::source revision $sha (ref ${{ steps.r.outputs.ref }})"
+
+      # v* no-overwrite guard (A3), demoted from a conditional JOB to a
+      # conditional STEP (2026-11-15 live round): the old job-level
+      # `if: startsWith(tag,'v')` made the job SKIP for mutable tags, and a
+      # job that `needs` a skipped job is skipped too - so docker_build and
+      # manifest were skipped for EVERY mutable-channel publish (the run
+      # ended "success" while publishing nothing). As a step inside resolve,
+      # a skipped guard step cannot skip the job graph: for mutable tags the
+      # step is skipped and ALL its outputs are EMPTY, and every consumer
+      # expression below treats empty as "build" (fail-safe direction: the
+      # worst case is a rebuild, never a silent skip). On a v* run the step
+      # runs; if it FAILS, resolve fails and plain needs-propagation blocks
+      # every writer (no always() anywhere).
+      #
+      # Checks 12 artifacts: the 8 arch tags (<tag>-amd64 / -arm64) + the 4
+      # final multi-arch indexes. Per-arch outputs gate the BUILD steps
+      # (retained arch layers are never re-pushed on a resume); per-index
+      # outputs gate the MANIFEST steps. An existing final index implies its
+      # two arch tags exist (the index is only assembled from both), so the
+      # per-index check is consistent with the per-arch ones.
+      # Semantics: confirmed present -> skip that artifact; authenticated
+      # 404 -> build it; ANY other HTTP code / auth / network error -> FAIL
+      # the run (a wrong "absent" would overwrite a released image, so fail
+      # safe). Runs under the shared A2 publication lock, so check->write
+      # cannot race a concurrent run.
+      - name: Check existing release artifacts (v* no-overwrite)
+        id: g
+        if: startsWith(steps.r.outputs.tag, 'v')
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.r.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ORG=consol-monitoring
+          PFX=omd-labs-systemd-vm-forge
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+          # GHCR bearer token from the workflow credentials (no personal
+          # token). Per the distribution token spec (auth/token), scopes are
+          # separated by repeated `scope=` URL parameters - a single
+          # comma-joined value is non-standard, so request them explicitly
+          # (pull-only, all four image paths) + the service param.
+          TOKEN=$(curl -fsS -G -u "$GH_ACTOR:$GH_TOKEN" \
+            --data-urlencode "service=ghcr.io" \
+            --data-urlencode "scope=repository:$ORG/$PFX/omd-labs-systemd-vm-rocky:pull" \
+            --data-urlencode "scope=repository:$ORG/$PFX/omd-labs-systemd-vm-debian:pull" \
+            --data-urlencode "scope=repository:$ORG/$PFX/omd-labs-systemd-vm-base-rocky:pull" \
+            --data-urlencode "scope=repository:$ORG/$PFX/omd-labs-systemd-vm-base-debian:pull" \
+            "https://ghcr.io/token" \
+            | jq -r .token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "::error::GHCR token exchange failed - cannot verify release existence (failing safe)"; exit 1; }
+          # check <image> <tag> -> 0 exists / 1 absent (404) / fail on any other code
+          check() {
+            local code
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+              "https://ghcr.io/v2/$ORG/$PFX/$1/manifests/$2")
+            case $code in
+              200) return 0;;
+              404) return 1;;
+              *) echo "::error::registry existence check $1:$2 returned HTTP $code - failing safe (no-overwrite cannot be verified)"; exit 1;;
+            esac
+          }
+          # emit <key> -> writes the boolean AND records the artifact state
+          emit() {
+            echo "$1=$2" >> "$GITHUB_OUTPUT"
+            [ "$2" = false ] && echo "::notice title=Publish::$1 absent - will (re)build this artifact" || true
+          }
+          all_exist=true
+          for os in rocky debian; do
+            for kind in base omd; do
+              if [ "$kind" = base ]; then IMG=omd-labs-systemd-vm-base-$os; else IMG=omd-labs-systemd-vm-$os; fi
+              for plat in amd64 arm64; do
+                if check "$IMG" "$TAG-$plat"; then
+                  emit "arch_${kind}_${os}_${plat}" true
+                else
+                  emit "arch_${kind}_${os}_${plat}" false; all_exist=false
+                fi
+              done
+              if check "$IMG" "$TAG"; then
+                emit "idx_${kind}_${os}" true
+              else
+                emit "idx_${kind}_${os}" false; all_exist=false
+              fi
+            done
+          done
+          echo "all_exist=$all_exist" >> "$GITHUB_OUTPUT"
+          if [ "$all_exist" = true ]; then
+            echo "::notice title=Publish::release $TAG already fully published (12/12 artifacts) - this run is a no-op (v* no-overwrite)"
+          fi
+
+      # Terminal signal for the (rare, legitimate) v* all-exist no-op: the
+      # run ends SUCCESS while intentionally publishing nothing. The notice
+      # above is per-step; the run SUMMARY makes it unmissable in the run UI.
+      # (For mutable tags this step is skipped - the guard step is skipped
+      # and all_exist is empty, so the condition is false.)
+      - name: Summary - no images published (release already exists)
+        if: ${{ startsWith(steps.r.outputs.tag, 'v') && steps.g.outputs.all_exist == 'true' }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## No images published - release already fully published
+          The v* release for tag \`${{ steps.r.outputs.tag }}\` (source
+          revision \`${{ steps.c.outputs.commit }}\`) already exists in GHCR -
+          all 12 artifacts (8 arch tags + 4 final indexes) were present.
+          Nothing was rebuilt or re-pushed (v* no-overwrite, A3).
+          EOF
 
   docker_build:
     runs-on: ${{ matrix.target.runs }}
@@ -83,10 +320,14 @@ jobs:
           - runs: ubuntu-24.04-arm
             platform: arm64
     steps:
-      - name: Check out the repo (matching ref)
+      - name: Check out the repo (pinned to the recorded commit)
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.resolve.outputs.ref }}
+          # A1, pinned to the COMMIT recorded by resolve - not the moving
+          # branch ref: a push to the branch between resolve and this step
+          # must not change what gets built (the revision label would no
+          # longer match the content).
+          ref: ${{ needs.resolve.outputs.commit }}
 
       # Docker Hub publishing is disabled for now; images go to GHCR only.
       # - name: Log in to Docker Hub
@@ -109,25 +350,90 @@ jobs:
         uses: mxschmitt/action-tmate@v3
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
 
-      - name: Build and Push
+      # OMD-preinstalled image (Dockerfile default `omd` stage). For a v* run
+      # whose OMD ARCH TAG already exists this is skipped (no-overwrite, even
+      # on a resume of a partial release); the missing-artifact case resumes
+      # here. PER-ARCH output (arch_*, not the final index): a retained arch
+      # layer is never re-pushed. Mutable tags: guard outputs are empty ->
+      # the condition is true -> the build runs (fail-safe).
+      # (Single line on purpose: an indented multi-line `if: >-` block keeps
+      # literal newlines inside the expression and does not fold.)
+      - name: Build and Push OMD (arch layer)
+        if: ${{ !(startsWith(needs.resolve.outputs.tag, 'v') && ((needs.resolve.outputs.arch_omd_rocky_amd64 == 'true' && matrix.os == 'rocky' && matrix.target.platform == 'amd64') || (needs.resolve.outputs.arch_omd_rocky_arm64 == 'true' && matrix.os == 'rocky' && matrix.target.platform == 'arm64') || (needs.resolve.outputs.arch_omd_debian_amd64 == 'true' && matrix.os == 'debian' && matrix.target.platform == 'amd64') || (needs.resolve.outputs.arch_omd_debian_arm64 == 'true' && matrix.os == 'debian' && matrix.target.platform == 'arm64'))) }}
         uses: docker/build-push-action@v7
         with:
-          push: true
+          context: .
           file: Dockerfile.omd-labs-systemd-vm-${{ matrix.os }}
+          target: omd
+          push: true
+          platforms: linux/${{ matrix.target.platform }}
           sbom: false
           provenance: false
           build-args: |
             OMD_VERSION=${{ needs.resolve.outputs.omd }}
             INSTALL_COMMON_RETRIES=3
             BUILDKIT_MULTI_PLATFORM=0
+          # A1: source-revision label (single resolved commit for the matrix).
+          # A5: log the installed package version per architecture (the only
+          # way to audit which package a mutable tag carries) - recorded via
+          # the workflow job log below + the build-args echo.
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
+            org.opencontainers.image.source=https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge
+            org.opencontainers.image.omd_version=${{ needs.resolve.outputs.omd }}
           # Docker Hub publishing is disabled for now (GHCR only). The
           # disabled tag is kept OUT of the tags block on purpose: the
-          # build-push action passes every line of the block to buildx,
-          # so a comment line there becomes an invalid tag.
+          # build-push action passes every line of the block to buildx, so a
+          # comment line there becomes an invalid tag.
           # consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-${{ matrix.target.platform }}
           tags: |
             ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-${{ matrix.target.platform }}
+
+      # OMD-less chassis (Dockerfile `base` stage) - the foundation the OMD
+      # image is built FROM. Same per-arch skip/resume semantics as the OMD
+      # layer above.
+      - name: Build and Push base (chassis, arch layer)
+        if: ${{ !(startsWith(needs.resolve.outputs.tag, 'v') && ((needs.resolve.outputs.arch_base_rocky_amd64 == 'true' && matrix.os == 'rocky' && matrix.target.platform == 'amd64') || (needs.resolve.outputs.arch_base_rocky_arm64 == 'true' && matrix.os == 'rocky' && matrix.target.platform == 'arm64') || (needs.resolve.outputs.arch_base_debian_amd64 == 'true' && matrix.os == 'debian' && matrix.target.platform == 'amd64') || (needs.resolve.outputs.arch_base_debian_arm64 == 'true' && matrix.os == 'debian' && matrix.target.platform == 'arm64'))) }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.omd-labs-systemd-vm-${{ matrix.os }}
+          target: base
+          push: true
           platforms: linux/${{ matrix.target.platform }}
+          sbom: false
+          provenance: false
+          build-args: |
+            INSTALL_COMMON_RETRIES=3
+            BUILDKIT_MULTI_PLATFORM=0
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
+            org.opencontainers.image.source=https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge
+            org.opencontainers.image.flavor=base
+          tags: |
+            ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-base-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-${{ matrix.target.platform }}
+
+      # A5: log the installed OMD package version for THIS architecture - the
+      # authoritative per-arch provenance audit (the build args / label carry
+      # the REQUESTED channel; this carries the package ACTUALLY installed).
+      # Pulls the just-pushed arch image (GHCR creds are in scope) and queries
+      # its package DB without booting (no --privileged needed for rpm/dpkg).
+      - name: Log installed OMD package version (per arch)
+        run: |
+          OS=${{ matrix.os }}
+          PLAT=${{ matrix.target.platform }}
+          TAG=${{ needs.resolve.outputs.tag }}
+          IMG="ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-$OS:$TAG-$PLAT"
+          if [ "$OS" = "rocky" ]; then
+            ver=$(docker run --rm "$IMG" sh -c "rpm -qa | grep -iE '^omd' | sort || echo '(no omd packages)'" 2>/dev/null) \
+              || ver="(arch image not pullable - see build log)"
+          else
+            ver=$(docker run --rm "$IMG" sh -c "dpkg -l | grep -iE '^ii +omd' | awk '{print \$1, \$2}' | sort || echo '(no omd packages)'" 2>/dev/null) \
+              || ver="(arch image not pullable - see build log)"
+          fi
+          echo "Installed OMD packages ($OS, linux/$PLAT):"
+          echo "$ver"
+          echo "::notice title=OMD package ($OS, linux/$PLAT)::$ver"
 
   manifest:
     runs-on: ubuntu-24.04
@@ -135,6 +441,15 @@ jobs:
     permissions:
       packages: write
       contents: read
+    # For a v* run whose release is ALREADY fully published (12/12
+    # artifacts), skip the whole job (no-op): the arch layers are retained
+    # and re-pushing the manifests would be a no-op. For mutable tags (guard
+    # step skipped -> all_exist empty) or a partial v* (resume), assemble +
+    # push. Note: resolve is a DIRECT need of this job, so the
+    # needs.resolve.outputs reference below is valid (a job reading another
+    # job's outputs without listing it in `needs` is not allowed).
+    # Single line on purpose (multi-line >- blocks keep literal newlines).
+    if: ${{ !(startsWith(needs.resolve.outputs.tag, 'v') && needs.resolve.outputs.all_exist == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -144,9 +459,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ needs.resolve.outputs.ref }}
+          # A1, pinned to the recorded commit (not the moving branch ref) -
+          # same rationale as in docker_build.
+          ref: ${{ needs.resolve.outputs.commit }}
 
-      # Docker Hub publishing is disabled for now; images go to GHCR only.
+      # Docker Hub publishing is disabled for now (GHCR only).
       # - name: Log in to Docker Hub
       #   uses: docker/login-action@v4.8.0
       #   with:
@@ -167,7 +484,7 @@ jobs:
         uses: mxschmitt/action-tmate@v3
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
 
-      # Docker Hub publishing is disabled for now; images go to GHCR only.
+      # Docker Hub publishing is disabled for now (GHCR only).
       # - name: push manifest to dockerhub
       #   run: |
       #       docker manifest create consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }} \
@@ -175,9 +492,28 @@ jobs:
       #                              consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-arm64
       #       docker manifest push consol/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}
 
-      - name: push manifest to github
+      # PER-INDEX skip (v* only): if this final multi-arch index already
+      # exists it is retained as-is (no re-push), even when its sibling
+      # distro's index is being (re)built in the other matrix arm.
+      - name: push OMD manifest to github
+        # case() (not a `? :` ternary - GitHub expressions have no ternary
+        # operator): select this matrix arm's index output by distro.
+        if: ${{ !(startsWith(needs.resolve.outputs.tag, 'v') && case(matrix.os == 'rocky', needs.resolve.outputs.idx_omd_rocky, needs.resolve.outputs.idx_omd_debian) == 'true') }}
         run: |
-            docker manifest create ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }} \
-                                   ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-amd64 \
-                                   ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}-arm64
-            docker manifest push ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:${{ needs.resolve.outputs.tag }}
+            IMG=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}
+            TAG=${{ needs.resolve.outputs.tag }}
+            docker manifest create "$IMG:$TAG" \
+                                   "$IMG:$TAG-amd64" \
+                                   "$IMG:$TAG-arm64"
+            docker manifest push "$IMG:$TAG"
+
+      # PER-INDEX skip (v* only), same rationale as the OMD index above.
+      - name: push base manifest to github
+        if: ${{ !(startsWith(needs.resolve.outputs.tag, 'v') && case(matrix.os == 'rocky', needs.resolve.outputs.idx_base_rocky, needs.resolve.outputs.idx_base_debian) == 'true') }}
+        run: |
+            IMG=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-base-${{ matrix.os }}
+            TAG=${{ needs.resolve.outputs.tag }}
+            docker manifest create "$IMG:$TAG" \
+                                   "$IMG:$TAG-amd64" \
+                                   "$IMG:$TAG-arm64"
+            docker manifest push "$IMG:$TAG"

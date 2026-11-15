@@ -1,4 +1,29 @@
-FROM debian:13
+# omd-labs-systemd-vm-debian — VM-like OMD container (systemd as PID 1).
+#
+# Two stages, ONE chassis (Stage 2, omd-labs-systemd-vm-forge):
+#   base - the OMD-less chassis: systemd boot, ready gate, entry/wrappers,
+#          edge (apache2) + ssh + cron owned by the chassis, iproute2 (the
+#          gate's `ss` probe), and BOTH labs.consol.de repos configured.
+#          Build/run this stage WITHOUT an OMD package; install any OMD
+#          version at runtime (or build a derived image).
+#   omd  - the OMD-preinstalled image: FROM the base stage + the OMD
+#          package layer. This is the default/final stage (`docker build`
+#          with no --target); `--target base` exports the chassis.
+#
+# Stage 2 rationale (debate/2026-11-14-stage12-review-design/99-consensus.md):
+# - decision: the base image IS the foundation — the OMD image is the base
+#   stage + the OMD layer, so the chassis can never drift between the two.
+# - EMPIRICAL (2026-11-14 no-OMD probe, rocky; debian by the same analysis):
+#   without OMD the chassis needs the base to own (a) the edge — apache2
+#   arrived via the OMD package — and (b) iproute2 — the ready gate's
+#   `listening()` uses `ss`, which arrived only transitively via OMD; its
+#   absence made the gate time out at the 120 s window with a healthy edge.
+#   cron is the third OMD-provided unit the base must own.
+
+###############################################################################
+# stage: base — the OMD-less chassis
+###############################################################################
+FROM debian:13 AS base
 LABEL org.opencontainers.image.authors="Lassi"
 LABEL org.opencontainers.image.source="https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge"
 EXPOSE 80 443 22 4730 5666
@@ -9,17 +34,62 @@ ENV REFRESHED=20250918
 ENV HOME=/root
 WORKDIR $HOME
 
-### OMD installation ######################################
-ARG OMD_VERSION
+#### common dependencies ##################################
+# The chassis's own dependency set (no OMD). install_common.sh runs ONCE here
+# (in the base stage) - mirroring the pre-Stage-2 single-stage image's order
+# (install_common then install_omd), split across stages: the OMD stage below
+# does NOT re-run it, it only runs install_omd.sh, so the OMD image's OMD-layer
+# behavior is unchanged by Stage 2.
+# NOTE: install_common.sh's trailing `rm -rf /var/lib/apt/lists/* /tmp/*
+# /var/tmp/*` clears the apt lists — the edge RUN below re-runs `apt-get
+# update` (the repo-config assertions need the metadata again).
 ARG INSTALL_COMMON_RETRIES=1
 ADD ./scripts/install_*.sh $HOME/
 RUN chmod +x $HOME/install_*.sh
 RUN $HOME/install_retry.sh -r $INSTALL_COMMON_RETRIES -d 30 -- $HOME/install_common.sh debian
-RUN $HOME/install_omd.sh debian $OMD_VERSION
-# systemd presence assertion (research.md C2 — zero package delta expected,
-# systemd arrives as an OMD dependency): fail loudly at build time if a
-# base/OMD change ever breaks systemd-as-PID1
-RUN test -x /sbin/init
+
+#### edge + probe dependencies (chassis-owned, no OMD) ####
+# systemd + systemd-sysv: the debian base image ships NO systemd package
+# (EMPIRICAL 2026-11-14: `dpkg -l systemd` on debian:13 = not installed) —
+# it arrived transitively via the OMD package; the base owns it now.
+# apache2 + ssl-cert: the HTTPS edge on the snakeoil certificate
+# (mirroring the OMD image, whose apache2 also serves 443 via the
+# enabled default-ssl site + ssl module). iproute2: the ready gate's
+# listener check uses `ss`. cron: crond/cron runs OMD/site jobs.
+# The assertion below fails loudly at build time if a base/dependency
+# change ever breaks systemd-as-PID1 (research.md C2). sshd is enabled here
+# explicitly (the sshd ENABLEMENT used to come from the OMD package).
+RUN apt-get update \
+    && apt-get install -y systemd systemd-sysv apache2 ssl-cert iproute2 cron \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && a2enmod ssl \
+    && a2ensite default-ssl \
+    && systemctl enable ssh apache2 cron \
+    && test -x /lib/systemd/systemd \
+    && test -x /sbin/init
+# NOTE: debian's ports.conf already carries `Listen 443` (ssl.conf) and the
+# snakeoil default-ssl site serves 443; no extra vhost is needed (the no-
+# site edge answers 443 exactly like the OMD image). The OMD package's own
+# vhost include (zzz_omd.conf, IncludeOptional /omd/apache/*.conf) layers
+# site vhosts on top at runtime.
+
+#### labs.consol.de repositories (both channels) ###########
+# The base image's product claim: the user can install ANY OMD version
+# (stable / daily / versioned) — both channels are configured, no OMD
+# package installed. The vendor-documented GPG key + [signed-by=] sources;
+# a build-time apt-get update validates both repos' metadata, then the
+# lists are cleared again (clean base contract).
+RUN curl -fsS "https://labs.consol.de/repo/stable/monitoring-repo-consol-de-gpg-2026.asc" \
+       -o /etc/apt/trusted.gpg.d/monitoring-repo-consol-de-gpg-2026.asc \
+    && echo "deb [signed-by=/etc/apt/trusted.gpg.d/monitoring-repo-consol-de-gpg-2026.asc] http://labs.consol.de/repo/stable/debian $(lsb_release -cs) main" \
+       > /etc/apt/sources.list.d/labs-consol-stable.list \
+    && echo "deb [signed-by=/etc/apt/trusted.gpg.d/monitoring-repo-consol-de-gpg-2026.asc] http://labs.consol.de/repo/testing/debian $(lsb_release -cs) main" \
+       > /etc/apt/sources.list.d/labs-consol-testing.list \
+    && apt-get update \
+    && apt-cache search omd-labs-edition | grep -q omd-labs-edition \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 #### ansible ################################################
 # Ansible stays installed in the image (available via `exec`); the default
@@ -79,19 +149,19 @@ RUN sed -i -e 's/@EDGE_UNIT@/apache2.service/' -e 's/@SSH_UNIT@/ssh.service/' /u
 #     (3) systemd 252 (Rocky) has no `systemctl enable --alias` — the
 #         unit-file Alias= is the version-independent mechanism
 #         (debate/102 E4).
-#   The OMD package pre-enables omd.service (a
+#   On the OMD stage the package pre-enables omd.service (a
 #   multi-user.target.wants/omd.service symlink to the vendor all-sites
-#   unit) — drop it so the enabled-set audit stays exact; the /etc alias
-#   shadows the vendor unit at load time, so the vendor file (package-owned)
-#   stays untouched. `journalctl -u omd` yields no entries — filter on
-#   omd-site (debate/102 E5).
+#   unit) — the OMD stage drops it (its vendor-cleanup RUN) so the
+#   enabled-set audit stays exact; the /etc alias shadows the vendor unit
+#   at load time, so the vendor file (package-owned) stays untouched.
+#   `journalctl -u omd` yields no entries — filter on omd-site (debate/102
+#   E5).
 # - getty@tty1 is disabled (container console model — no getty in a container)
 # - omd-site + omd-ready are ENABLED (offline enable creates the
-#   multi-user.target.wants/ symlinks + the omd.service alias); sshd +
-#   apache2 stay pre-enabled by the OMD package (no enable lines needed — D8)
+#   multi-user.target.wants/ symlinks + the omd.service alias); ssh stays
+#   pre-enabled by the common deps, apache2 + cron by the edge RUN above.
 # Order matters [EMPIRICAL]: `systemctl enable` refuses to create an alias
-# when /etc/systemd/system/omd.service already exists — the old images carry
-# the D8 mask (a /dev/null symlink) there — so UNMASK FIRST.
+# when /etc/systemd/system/omd.service already exists — so UNMASK FIRST.
 RUN rm -f /etc/systemd/system/omd.service \
           /etc/systemd/system/multi-user.target.wants/omd.service
 RUN systemctl disable getty@tty1.service
@@ -104,3 +174,27 @@ RUN test -L /etc/systemd/system/omd.service \
          = /usr/lib/systemd/system/omd-site.service
 
 CMD ["/usr/local/bin/omd-labs-entry"]
+
+###############################################################################
+# stage: omd — the OMD-preinstalled image (default/final stage)
+###############################################################################
+FROM base AS omd
+ARG OMD_VERSION
+# The OMD layer = the OMD package + post-install normalization. install_common
+# already ran (in the base stage), so this mirrors the pre-Stage-2 single-stage
+# order (install_common then install_omd) split across stages - the OMD
+# package's own `apt-get update` + install is the single update pass for this
+# layer (lists cleared, as before).
+RUN $HOME/install_omd.sh debian $OMD_VERSION
+# vendor normalization (post-package): drop the vendor's all-sites omd.service
+# enablement (the /etc alias shadows it at load time; the vendor file stays
+# package-owned), re-assert the chassis alias, and re-assert the edge/cron/sshd
+# enablement the package might have reordered. The OMD package's own
+# apache vhost include (zzz_omd.conf, IncludeOptional /omd/apache/*.conf) is
+# left in place — it is the site-vhost hook.
+RUN rm -f /etc/systemd/system/omd.service \
+          /etc/systemd/system/multi-user.target.wants/omd.service \
+    && systemctl enable omd-site.service omd-ready.service ssh apache2 cron \
+    && test -L /etc/systemd/system/omd.service \
+    && test "$(readlink -f /etc/systemd/system/omd.service)" \
+         = /usr/lib/systemd/system/omd-site.service

@@ -10495,3 +10495,293 @@ ready=active edge=active ssh=active
   - PASS active verification run's containers untouched (current-run tie-break + a second run's `flock` measured HELD while the active run held the lock)
   - PASS real-scenario smoke: `verify/run.sh s1 rocky r2-test` — all PASS, clean stop 130, no leftover containers (section `S1-s1-rocky` above)
 - **lint**: `bash -n` OK on all changed files; ShellCheck unavailable on this host (recorded note — repo rule: ShellCheck *if available*)
+## S11a-s11a-rocky
+- when: 2026-11-15 11:03:50
+- runtime: podman
+
+- **RESULT: PASS**
+
+- base image: local/omd-labs-systemd-vm-base-rocky:nightly (edge unit httpd, expect no-site HTTP 403)
+- PASS: base readiness within bound (gate active + 443 answers)
+```
+ready-time=2s rc=0
+```
+
+- PASS: omd-ready + httpd + sshd all active
+```
+ready=active edge=active ssh=active
+```
+
+- PASS: edge answers the EXACT no-site code (403) on 443
+```
+code=403
+```
+
+- PASS: ss (the ready-gate probe tool) is PRESENT - a named cause, not a silent 120 s deadline
+```
+ss at: /usr/sbin/ss
+```
+
+- PASS: the omd binary is ABSENT (OMD-less chassis)
+```
+omd absent (ok)
+```
+
+- PASS: sshd reachable from host on 18452
+- PASS: omd.service resolves to the omd-site alias
+```
+alias -> /usr/lib/systemd/system/omd-site.service
+```
+
+- PASS: both labs.consol.de channels configured (stable + testing)
+- PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- teardown done
+## S11a-ff-s11a-failfast-rocky
+- when: 2026-11-15 11:04:03
+- runtime: podman
+
+- **RESULT: PASS**
+
+- base image: local/omd-labs-systemd-vm-base-rocky:nightly, starting with SITENAME=demo (must fail fast)
+- PASS: container exited (fail-fast, not a running site attempt)
+```
+exited after 1s
+```
+
+- PASS: exit code is 1 (EXIT_FATAL), not the 120 s deadline (2)
+```
+exit=1
+```
+
+- PASS: elapsed < 5 s (fail-fast budget)
+```
+elapsed=1s
+```
+
+- PASS: named cause in /var/log/omd-labs/entry-fatal (OMD not installed)
+```
+FATAL: OMD is not installed in this image (the base image is chassis-only). Install an OMD package first - the labs.consol.de repositories are already configured (dnf install omd-labs-edition / apt-get install omd-labs-edition, or omd-<ver>-labs-edition / omd-labs-edition-daily) - then re-run with SITENAME.
+```
+
+- PASS: NO partial /omd/sites/demo left behind (the pre-fix defect)
+```
+partial entries: 0
+```
+
+- teardown done
+## S11a-s11a-debian
+- when: 2026-11-15 11:11:31
+- runtime: podman
+
+- **RESULT: PASS**
+
+- base image: local/omd-labs-systemd-vm-base-debian:nightly (edge unit apache2, expect no-site HTTP 200)
+- PASS: base readiness within bound (gate active + 443 answers)
+```
+ready-time=2s rc=0
+```
+
+- PASS: omd-ready + apache2 + ssh all active
+```
+ready=active edge=active ssh=active
+```
+
+- PASS: edge answers the EXACT no-site code (200) on 443
+```
+code=200
+```
+
+- PASS: ss (the ready-gate probe tool) is PRESENT - a named cause, not a silent 120 s deadline
+```
+ss at: /usr/bin/ss
+```
+
+- PASS: the omd binary is ABSENT (OMD-less chassis)
+```
+omd absent (ok)
+```
+
+- PASS: sshd reachable from host on 18452
+- PASS: omd.service resolves to the omd-site alias
+```
+alias -> /usr/lib/systemd/system/omd-site.service
+```
+
+- PASS: both labs.consol.de channels configured (stable + testing)
+- PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- teardown done
+## S11a-ff-s11a-failfast-debian
+- when: 2026-11-15 11:12:16
+- runtime: podman
+
+- **RESULT: PASS**
+
+- base image: local/omd-labs-systemd-vm-base-debian:nightly, starting with SITENAME=demo (must fail fast)
+- PASS: container exited (fail-fast, not a running site attempt)
+```
+exited after 1s
+```
+
+- PASS: exit code is 1 (EXIT_FATAL), not the 120 s deadline (2)
+```
+exit=1
+```
+
+- PASS: elapsed < 5 s (fail-fast budget)
+```
+elapsed=1s
+```
+
+- PASS: named cause in /var/log/omd-labs/entry-fatal (OMD not installed)
+```
+FATAL: OMD is not installed in this image (the base image is chassis-only). Install an OMD package first - the labs.consol.de repositories are already configured (dnf install omd-labs-edition / apt-get install omd-labs-edition, or omd-<ver>-labs-edition / omd-labs-edition-daily) - then re-run with SITENAME.
+```
+
+- PASS: NO partial /omd/sites/demo left behind (the pre-fix defect)
+```
+partial entries: 0
+```
+
+- teardown done
+## S1-s1-rocky
+- when: 2026-11-15 11:23:00
+- runtime: podman
+
+- **RESULT: PASS**
+
+- container: omd-s1 (https 18451, ssh 18452, edge unit httpd)
+- PASS: readiness within bound (gate active + 443 answers)
+```
+ready-time=2s rc=0
+```
+
+- PASS: no OMD site exists (SC-003: /omd/sites empty)
+- PASS: omd-ready + httpd + sshd all active
+```
+ready=active edge=active ssh=active
+```
+
+- PASS: listeners on 443 + 80 + 22 (in-container; FR-002: edge on 443 AND 80)
+- PASS: sshd reachable from host on 18452
+- PASS: informational banner in container log (FR-015: no site)
+- PASS: stop httpd -> 443 down -> start -> back (SC-006)
+- PASS: stop sshd -> 22 down -> start -> back (SC-006)
+- PASS: journalctl -u httpd returns logs (FR-016)
+- PASS: container log shows startup sequence (FR-015)
+- ready-time recorded above; median-of-5 formal baseline = T034 (FR-018)
+- PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- teardown done
+## S11b-s11b-rocky
+- when: 2026-11-15 11:30:34
+- runtime: podman
+
+- **RESULT: PASS**
+
+- derived image (FROM local/omd-labs-systemd-vm-base-rocky:nightly + stable OMD): local/omd-labs-systemd-vm-s11b-rocky:latest
+- PASS: build derived image (base + stable OMD package from the base's repos)
+```
+352f8f1b8a9e9b3b7030b2fdcde59bf8f6c8635f2ebe5070837bd163523bb7a0
+```
+
+- PASS: site readiness within bound (gate active + /s11b 2xx/3xx)
+```
+ready-time=5s rc=0
+```
+
+- PASS: omd is now present (installed from the base's repos)
+```
+omd present
+```
+
+- PASS: /s11b answers 2xx/3xx (site UI / login redirect)
+```
+code=302
+```
+
+- PASS: omd status s11b rc 0 (site running)
+```
+rrdcached:      running
+npcd:           running
+naemon:         running
+apache:         running
+crontab:        running
+-----------------------
+Overall state:  running
+omd status rc=0
+```
+
+- PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- teardown done (derived image local/omd-labs-systemd-vm-s11b-rocky:latest retained for inspection)
+## S11b-s11b-debian
+- when: 2026-11-15 11:32:13
+- runtime: podman
+
+- **RESULT: PASS**
+
+- derived image (FROM local/omd-labs-systemd-vm-base-debian:nightly + stable OMD): local/omd-labs-systemd-vm-s11b-debian:latest
+- PASS: build derived image (base + stable OMD package from the base's repos)
+```
++ main debian latest
++ BRANCH=latest
++ BRANCH=latest
++ BRANCH=latest
++ case $1 in
++ install_omd_debian latest
++ VERSION=latest
+++ pkgName latest
+++ case $1 in
+++ echo omd-labs-edition
++ PACKAGENAME=omd-labs-edition
+++ repoVersion latest
+++ '[' xlatest == xlatest ']'
+++ echo stable
++ REPOVERSION=stable
++ export DEBIAN_FRONTEND=noninteractive
++ DEBIAN_FRONTEND=noninteractive
++ curl -fsS https://labs.consol.de/repo/stable/monitoring-repo-consol-de-gpg-2026.asc -o /etc/apt/trusted.gpg.d/monitoring-repo-consol-de-gpg-2026.asc
+++ lsb_release -cs
++ echo 'deb http://labs.consol.de/repo/stable/debian trixie main'
++ apt-get update
++ apt-get install -y omd-labs-edition
++ apt-get clean
++ rm -rf /var/lib/apt/lists/auxfiles /var/lib/apt/lists/deb.debian.org_debian-security_dists_trixie-security_InRelease /var/lib/apt/lists/deb.debian.org_debian-security_dists_trixie-security_main_binary-amd64_Packages.lz4 /var/lib/apt/lists/deb.debian.org_debian_dists_trixie-updates_InRelease /var/lib/apt/lists/deb.debian.org_debian_dists_trixie-updates_main_binary-amd64_Packages.lz4 /var/lib/apt/lists/deb.debian.org_debian_dists_trixie_InRelease /var/lib/apt/lists/deb.debian.org_debian_dists_trixie_main_binary-amd64_Packages.lz4 /var/lib/apt/lists/labs.consol.de_repo_stable_debian_dists_trixie_InRelease /var/lib/apt/lists/labs.consol.de_repo_stable_debian_dists_trixie_main_binary-amd64_Packages.lz4 /var/lib/apt/lists/labs.consol.de_repo_testing_debian_dists_trixie_InRelease /var/lib/apt/lists/labs.consol.de_repo_testing_debian_dists_trixie_main_binary-amd64_Packages.lz4 /var/lib/apt/lists/lock /var/lib/apt/lists/partial /tmp/install_omd.sh '/var/tmp/*'
++ find /omd/versions/default/skel/etc/logrotate.d -type f -exec sed -i 's/rotate [0-9]*/rotate 0/' '{}' ';'
+Synchronizing state of ssh.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.
+Executing: /usr/lib/systemd/systemd-sysv-install enable ssh
+Synchronizing state of apache2.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.
+Executing: /usr/lib/systemd/systemd-sysv-install enable apache2
+Synchronizing state of cron.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.
+Executing: /usr/lib/systemd/systemd-sysv-install enable cron
+Created symlink '/etc/systemd/system/omd.service' → '/usr/lib/systemd/system/omd-site.service'.
+351715bc26d346c509067629aea20f34a46b390c9e35e0c0bbe4f3c4ade8ebf8
+```
+
+- PASS: site readiness within bound (gate active + /s11b 2xx/3xx)
+```
+ready-time=6s rc=0
+```
+
+- PASS: omd is now present (installed from the base's repos)
+```
+omd present
+```
+
+- PASS: /s11b answers 2xx/3xx (site UI / login redirect)
+```
+code=302
+```
+
+- PASS: omd status s11b rc 0 (site running)
+```
+rrdcached:      running
+npcd:           running
+naemon:         running
+apache:         running
+crontab:        running
+-----------------------
+Overall state:  running
+omd status rc=0
+```
+
+- PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- teardown done (derived image local/omd-labs-systemd-vm-s11b-debian:latest retained for inspection)

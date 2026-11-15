@@ -14,13 +14,26 @@ Author: Lassi (the AI hosted at ConSol)
 
 Images are published to the GitHub Container Registry:
 
-- <https://ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-rocky> (x86 / arm64)
-- <https://ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-debian> (x86 / arm64)
+- <https://ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-rocky> (x86 / arm64) — the **OMD** image
+- <https://ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-debian> (x86 / arm64) — the **OMD** image
+- <https://ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-base-rocky> (x86 / arm64) — the **base** (OMD-less chassis)
+- <https://ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-base-debian> (x86 / arm64) — the **base** (OMD-less chassis)
 
 (Docker Hub publishing is disabled for now; the images are published to
 the GitHub Container Registry.)
 
-**Triggers** (see `.github/workflows/`):
+There are **two images** per distro (see *The base image*):
+
+- **`omd-labs-systemd-vm-<distro>`** — the OMD-preinstalled image (OMD is
+  already in it; run it with `SITENAME`). The default choice.
+- **`omd-labs-systemd-vm-base-<distro>`** — the OMD-less chassis: the
+  systemd VM, the edge + sshd + cron, and both `labs.consol.de` repos are
+  configured, but **no OMD package**. Start it with **no** `SITENAME` and
+  install any OMD version at runtime (or build a derived image).
+
+**Triggers** (see `.github/workflows/`). Both images are published together
+by the OMD runs below (the base rides the OMD publish runs — the OMD image
+is built `FROM` the same-checkout base stage, so the two never drift):
 
 - **OMD webhook** — the OMD build pipeline posts a
   `repository_dispatch` (`omd-published`) after publishing an OMD
@@ -31,8 +44,11 @@ the GitHub Container Registry.)
 - **tag push `v<maj>.<min>`** — publishes **:v\<maj\>.\<min\>** (immutable)
   and re-points **:latest** to this release
 - **branch push / pull request** — *test build only* (both distros, both
-  architectures); nothing is published, so a bad OMD package or a broken
-  repo state fails in CI before users can pull it
+  architectures); nothing is published. **CI is compilation coverage, not a
+  runtime publication gate**: it proves the OMD package and this repository
+  still build into an image; neither publisher depends on CI, and CI does
+  not run the `verify/` suite. Runtime readiness is exercised by the
+  verification suite (`verify/`), not by the publish pipeline.
 
 **Tag scheme:** `nightly` and `latest` move (mutable); `v<maj>.<min>` tags
 are immutable; `-amd64`/`-arm64` are the architecture-specific layers
@@ -103,6 +119,68 @@ Both are ordinary systemd units: you can `systemctl stop`/`start`/`restart`
 them and inspect them with `systemctl status`, `journalctl -u`. A
 post-ready service failure keeps the container **up** and is recoverable
 with `systemctl restart <unit>`.
+
+## The base image
+
+Besides the OMD image there is an **OMD-less chassis image**,
+`omd-labs-systemd-vm-base-<distro>`. It is the *foundation* of the OMD image
+(the OMD image is built `FROM` the same base stage) and is for users who want
+the VM-like chassis — systemd as PID 1, the edge + sshd + cron, a bounded
+readiness gate — **without a baked-in OMD version**, so they can install
+*any* OMD release (stable / daily / versioned) at runtime or build their own
+derived image.
+
+**What the base image ships (no OMD package):**
+
+- the full chassis: the entry bootstrap, the ready gate, the service
+  wrappers/units, and the same runtime contract as the OMD image
+  (readiness gate, `STOPSIGNAL`, exit-code contract, `SITENAME` handling).
+- the **edge** (`httpd`/`apache2`) on 443 (and 80) + **sshd** on 22 +
+  **cron**, all owned by the chassis and enabled. (In the OMD image these
+  arrived via the OMD package; the base owns them directly so a no-OMD boot
+  reaches the ready gate.)
+- `iproute`/`iproute2` (the `ss` probe the ready gate uses) — a missing probe
+  tool would otherwise fail the gate with a *silent* 120 s deadline.
+- **both** `labs.consol.de` channels (`stable` + `testing`) configured with
+  GPG verification — so *any* OMD version is installable.
+
+**What it does NOT do:** run a site. There is no OMD package, so the `omd`
+binary is absent. Starting the base **with a `SITENAME` fails fast** (exits 1
+in <5 s, named cause in `/var/log/omd-labs/entry-fatal`) — it refuses before
+touching the site path, so no partial site is left behind. Start it with **no**
+`SITENAME` first.
+
+**Two ways to use it** (both covered by the verification suite, S11b):
+
+1. **Preferred / reproducible — a derived image.** Install the package at
+   *build* time (a `FROM` the base + `dnf`/`apt` install of your chosen OMD
+   version), then run the derived image with `SITENAME=…` for the normal
+   lifecycle.
+2. **Runtime install.** Run the base (no `SITENAME`, `--privileged`,
+   `--systemd=always` on Podman), wait for readiness, then inside the running
+   container: install a package
+   (`omd-labs-edition` stable / `omd-labs-edition-daily` testing /
+   `omd-<maj>.<min>-labs-edition` versioned), run the post-install
+   normalization, then create + start a site manually with `omd`. The site is
+   a manual site (`SITE_ACTIVE` stays 0) — stop it explicitly before stopping
+   the container.
+
+**Reading the no-site edge:** the base answers 443 with the Apache base
+response — **403** on Rocky (self-signed localhost cert, no index doc) and
+**200** on Debian (the snakeoil `default-ssl` site, mirroring the OMD image
+whose `apache2` likewise serves `default-ssl`). Either way the readiness gate
+has already verified the listeners; a `curl` returning a real code (not 000)
+confirms the edge is up.
+
+**Labeling / residual lag.** The base `:<tag>` labels ride the OMD publish
+runs (see *Triggers*): `base-<os>:v*` are cut alongside the OMD `v*` under the
+same immutability rule, and `base-<os>:latest` is re-pointed under the same
+`:latest` guard. **Residual lag:** same-checkout inheritance means a published
+OMD image never *consumes* a stale published base — but a *later*
+**base-only** refresh does **not** update an already-published OMD image (it
+stays on its old layers until the next mutable-channel build; frozen `v*`
+images stay frozen). An explicit base-only refresh is an optional manual path,
+not required for correctness.
 
 ## SSH credentials (optional)
 
@@ -417,20 +495,26 @@ the reason and FATAL-BLOCK.
 
 ## Getting an image
 
-The `local/omd-labs-<distro>:<TAG>` images in the examples below come from
-a **local build** — build one first (branch-derived tag: `master` ⇒
-`nightly`):
+The `local/omd-labs-systemd-vm-<distro>:<TAG>` (OMD) images and
+`local/omd-labs-systemd-vm-base-<distro>:<TAG>` (base) images in the examples
+below come from a **local build** — build one first (branch-derived tag:
+`master` ⇒ `nightly`):
 
 ```bash
-make -f Makefile.omd-labs-systemd-vm-rocky build          # Rocky 9
-make -f Makefile.omd-labs-systemd-vm-debian build         # Debian 13
+make -f Makefile.omd-labs-systemd-vm-rocky build          # Rocky 9 (OMD image)
+make -f Makefile.omd-labs-systemd-vm-debian build         # Debian 13 (OMD image)
+# the OMD-less chassis (base) image:
+make -f Makefile.omd-labs-systemd-vm-rocky build FLAVOR=base    # -> local/omd-labs-systemd-vm-base-rocky:<TAG>
+make -f Makefile.omd-labs-systemd-vm-debian build FLAVOR=base   # -> local/omd-labs-systemd-vm-base-debian:<TAG>
 ```
 
-The build target always runs `docker build` (it is the same hook the
-automated build system uses; it passes the **branch** as `OMD_VERSION`).
-On a podman-only host
-build directly — use the **branch-equivalent** `OMD_VERSION` for the tag
-you want (see `scripts/install_omd.sh` for the mapping):
+The `FLAVOR` flag selects the Dockerfile stage (default `omd` = the existing
+OMD image, so existing users are unchanged; `base` = the chassis, built with
+`--target base`). The build target always runs `docker build` (the same hook
+the automated build system uses; it passes the **branch** as `OMD_VERSION`).
+On a podman-only host build directly — use the **branch-equivalent**
+`OMD_VERSION` for the tag you want (see `scripts/install_omd.sh` for the
+mapping):
 
 ```bash
 # nightly (master branch): the daily package from the *testing* repo
@@ -445,8 +529,12 @@ podman build -f Dockerfile.omd-labs-systemd-vm-rocky -t local/omd-labs-systemd-v
 podman build -f Dockerfile.omd-labs-systemd-vm-rocky -t local/omd-labs-systemd-vm-rocky:v5.81 \
   --build-arg OMD_VERSION=5.81 .
 
+# the OMD-less chassis (base) image: the same Dockerfile's `base` stage
+podman build -f Dockerfile.omd-labs-systemd-vm-rocky --target base \
+  -t local/omd-labs-systemd-vm-base-rocky:nightly .
+
 # Debian 13 is the same with Dockerfile.omd-labs-systemd-vm-debian
-# (and local/omd-labs-systemd-vm-debian:<TAG> as the tag)
+# (and local/omd-labs-systemd-vm-debian:<TAG> / ...-base-debian:<TAG> as the tag)
 ```
 
 Note: `OMD_VERSION=5.81` is **not** the `nightly` content — it selects

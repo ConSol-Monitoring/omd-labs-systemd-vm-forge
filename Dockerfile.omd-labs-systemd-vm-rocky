@@ -1,4 +1,29 @@
-FROM rockylinux:9
+# omd-labs-systemd-vm-rocky — VM-like OMD container (systemd as PID 1).
+#
+# Two stages, ONE chassis (Stage 2, omd-labs-systemd-vm-forge):
+#   base - the OMD-less chassis: systemd boot, ready gate, entry/wrappers,
+#          edge (httpd) + sshd + cron owned by the chassis, iproute (the
+#          gate's `ss` probe), and BOTH labs.consol.de repos configured.
+#          Build/run this stage WITHOUT an OMD package; install any OMD
+#          version at runtime (or build a derived image).
+#   omd  - the OMD-preinstalled image: FROM the base stage + the OMD
+#          package layer. This is the default/final stage (`docker build`
+#          with no --target); `--target base` exports the chassis.
+#
+# Stage 2 rationale (debate/2026-11-14-stage12-review-design/99-consensus.md):
+# - decision: the base image IS the foundation — the OMD image is the base
+#   stage + the OMD layer, so the chassis can never drift between the two.
+# - EMPIRICAL (2026-11-14 no-OMD probe): without OMD the chassis needs the
+#   base to own (a) the edge — httpd was arriving via the OMD package — and
+#   (b) iproute — the ready gate's `listening()` uses `ss`, which arrived
+#   only transitively via OMD; its absence made the gate time out at the
+#   120 s window with the edge perfectly healthy. cron (crond) is the third
+#   OMD-provided unit the base must own.
+
+###############################################################################
+# stage: base — the OMD-less chassis
+###############################################################################
+FROM rockylinux:9 AS base
 LABEL org.opencontainers.image.authors="Lassi"
 LABEL org.opencontainers.image.source="https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge"
 EXPOSE 80 443 22 4730 5666
@@ -9,17 +34,63 @@ ENV REFRESHED=20250918
 ENV HOME=/root
 WORKDIR $HOME
 
-### OMD installation ######################################
-ARG OMD_VERSION
+#### common dependencies ##################################
+# The chassis's own dependency set (no OMD). install_common.sh runs ONCE here
+# (in the base stage) - mirroring the pre-Stage-2 single-stage image's order
+# (install_common then install_omd), split across stages: the OMD stage below
+# does NOT re-run it, it only runs install_omd.sh, so the OMD image's OMD-layer
+# behavior is unchanged by Stage 2.
 ARG INSTALL_COMMON_RETRIES=1
 ADD ./scripts/install_*.sh $HOME/
 RUN chmod +x $HOME/install_*.sh
 RUN $HOME/install_retry.sh -r $INSTALL_COMMON_RETRIES -d 30 -- $HOME/install_common.sh rocky
-RUN $HOME/install_omd.sh rocky $OMD_VERSION
-# systemd presence assertion (research.md C2 — zero package delta expected,
-# systemd arrives as an OMD dependency): fail loudly at build time if a
-# base/OMD change ever breaks systemd-as-PID1
-RUN test -x /sbin/init
+
+#### edge + probe dependencies (chassis-owned, no OMD) ####
+# EMPIRICAL (2026-11-15 probe): rockylinux:9 ships NEITHER systemd NOR
+# /sbin/init (both arrived via the OMD package in the single-stage image).
+# The base owns them so systemd-as-PID1 + the init assertion hold with no OMD.
+# httpd + mod_ssl: the HTTPS edge (the OMD package used to supply it — the
+# base owns it now so a no-OMD boot reaches the ready gate).
+# iproute: the ready gate's listener check uses `ss` (omd-ready-check
+# listening()) — without it the gate polls to the 120 s deadline with a
+# healthy edge (EMPIRICAL 2026-11-14). cronie: crond runs OMD/site jobs.
+# sshd is enabled here (install_common.sh installs openssh-server but the
+# sshd ENABLEMENT used to come from the OMD package).
+# The assertion below fails loudly at build time if a base/dependency change
+# ever breaks systemd-as-PID1 (research.md C2).
+RUN dnf -y install systemd httpd mod_ssl iproute cronie \
+    && systemctl enable sshd httpd crond \
+    && test -x /sbin/init
+# a self-signed localhost certificate + a 443 vhost (the no-site edge
+# answers 443 with the Apache base response; the OMD package's own vhost
+# include (zzz_omd.conf, IncludeOptional /omd/apache/*.conf) tolerates an
+# absent /omd and layers site vhosts on top of this at runtime).
+# NOTE: no `Listen 443` here — mod_ssl's ssl.conf already defines the
+# 443 https listener; a second one fails httpd startup (AH00526, EMPIRICAL
+# 2026-11-14 probe v3/v4).
+RUN mkdir -p /etc/pki/tls/certs /etc/pki/tls/private \
+    && openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+         -keyout /etc/pki/tls/private/localhost.key \
+         -out /etc/pki/tls/certs/localhost.crt \
+         -subj "/CN=localhost" \
+    && printf '<VirtualHost _default_:443>\nServerName localhost\nSSLEngine on\nSSLCertificateFile /etc/pki/tls/certs/localhost.crt\nSSLCertificateKeyFile /etc/pki/tls/private/localhost.key\n</VirtualHost>\n' \
+       > /etc/httpd/conf.d/zzz_base_edge.conf \
+    && httpd -t
+
+#### labs.consol.de repositories (both channels) ###########
+# The base image's product claim: the user can install ANY OMD version
+# (stable / daily / versioned) — both channels are configured, no OMD
+# package installed. The repo RPMs carry the GPG config (gpgcheck=1, key
+# auto-fetched from the vendor); install_common.sh's `dnf -y update` above
+# already validated both repos' metadata.
+RUN rpm -Uvh "https://labs.consol.de/repo/stable/rhel9/x86_64/labs-consol-stable.rhel9.noarch.rpm" \
+    && rpm -Uvh "https://labs.consol.de/repo/testing/rhel9/x86_64/labs-consol-testing.rhel9.noarch.rpm" \
+    && dnf clean all
+# loud build-time assertions: both channels are enabled and carry OMD
+# packages (the "any version installable" contract).
+RUN dnf -q repolist --enabled | grep -q labs_consol_stable \
+    && dnf -q repolist --enabled | grep -q labs_consol_testing \
+    && dnf -q list available 'omd-labs-edition*' | grep -q omd-labs-edition
 
 #### ansible ################################################
 # Ansible stays installed in the image (available via `exec`); the default
@@ -79,19 +150,19 @@ RUN sed -i -e 's/@EDGE_UNIT@/httpd.service/' -e 's/@SSH_UNIT@/sshd.service/' /us
 #     (3) systemd 252 (Rocky) has no `systemctl enable --alias` — the
 #         unit-file Alias= is the version-independent mechanism
 #         (debate/102 E4).
-#   The OMD package pre-enables omd.service (a
+#   On the OMD stage the package pre-enables omd.service (a
 #   multi-user.target.wants/omd.service symlink to the vendor all-sites
-#   unit) — drop it so the enabled-set audit stays exact; the /etc alias
-#   shadows the vendor unit at load time, so the vendor file (package-owned)
-#   stays untouched. `journalctl -u omd` yields no entries — filter on
-#   omd-site (debate/102 E5).
+#   unit) — the OMD stage drops it (its vendor-cleanup RUN) so the
+#   enabled-set audit stays exact; the /etc alias shadows the vendor unit
+#   at load time, so the vendor file (package-owned) stays untouched.
+#   `journalctl -u omd` yields no entries — filter on omd-site (debate/102
+#   E5).
 # - getty@tty1 is disabled (container console model — no getty in a container)
 # - omd-site + omd-ready are ENABLED (offline enable creates the
-#   multi-user.target.wants/ symlinks + the omd.service alias); sshd + httpd
-#   stay pre-enabled by the OMD package (no enable lines needed — D8)
+#   multi-user.target.wants/ symlinks + the omd.service alias); sshd stays
+#   pre-enabled by the common deps, httpd + crond by the edge RUN above.
 # Order matters [EMPIRICAL]: `systemctl enable` refuses to create an alias
-# when /etc/systemd/system/omd.service already exists — the old images carry
-# the D8 mask (a /dev/null symlink) there — so UNMASK FIRST.
+# when /etc/systemd/system/omd.service already exists — so UNMASK FIRST.
 RUN rm -f /etc/systemd/system/omd.service \
           /etc/systemd/system/multi-user.target.wants/omd.service
 RUN systemctl disable getty@tty1.service
@@ -104,3 +175,27 @@ RUN test -L /etc/systemd/system/omd.service \
          = /usr/lib/systemd/system/omd-site.service
 
 CMD ["/usr/local/bin/omd-labs-entry"]
+
+###############################################################################
+# stage: omd — the OMD-preinstalled image (default/final stage)
+###############################################################################
+FROM base AS omd
+ARG OMD_VERSION
+# The OMD layer = the OMD package + post-install normalization. install_common
+# already ran (in the base stage), so this mirrors the pre-Stage-2 single-stage
+# order (install_common then install_omd) split across stages - the OMD
+# package's own `yum update` + install is the single update pass for this
+# layer (Stage 2 must not alter the OMD image's OMD-layer behavior).
+RUN $HOME/install_omd.sh rocky $OMD_VERSION
+# vendor normalization (post-package): drop the vendor's all-sites omd.service
+# enablement (the /etc alias shadows it at load time; the vendor file stays
+# package-owned), re-assert the chassis alias, and re-assert the edge/cron/sshd
+# enablement the package might have reordered. The OMD package's own
+# httpd/ssl vhost include (zzz_omd.conf, IncludeOptional /omd/apache/*.conf)
+# is left in place — it is the site-vhost hook.
+RUN rm -f /etc/systemd/system/omd.service \
+          /etc/systemd/system/multi-user.target.wants/omd.service \
+    && systemctl enable omd-site.service omd-ready.service sshd httpd crond \
+    && test -L /etc/systemd/system/omd.service \
+    && test "$(readlink -f /etc/systemd/system/omd.service)" \
+         = /usr/lib/systemd/system/omd-site.service

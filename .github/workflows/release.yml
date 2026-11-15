@@ -2,12 +2,36 @@
 # package (omd-<maj>.<min>-labs-edition from the stable repo) and publishes
 # BOTH tags:
 #   :v<maj>.<min>  - the immutable release tag
-#   :latest        - re-pointed to this release (newest published v* wins;
-#                    releases are assumed to be published in ascending order)
+#   :latest        - re-pointed to this release, GATED (see A4 guard below)
 #
-# Test builds for this ref already run via .github/workflows/ci.yml on the
-# push of the tag - this workflow adds the publish.
+# NOTE (A5 correction): test builds for this ref run via ci.yml on the PUSH of
+# the tag is INCORRECT - ci.yml has NO tag trigger (push branches + PR +
+# dispatch only). Tag pushes are test-built only if you also push the ref; the
+# tag-push itself triggers ONLY this workflow.
+#
+# A manual workflow_dispatch with a `version` input is the fallback
+# (re)publish path, with a `force_latest` override.
+#
+# BOTH images are published from one checkout (Stage 2): the OMD image
+# (Dockerfile `omd` stage) and the OMD-less chassis (Dockerfile `base` stage).
+# The base `:v*` is cut alongside the OMD `:v*` under the same no-overwrite
+# rule; the base `:latest` is re-pointed under the same guard.
+#
+# Tag scheme (ratified): v<maj>.<min> IMMUTABLE - a v* run whose artifacts
+# already exist in GHCR is a no-op (never rebuild+overwrite a published
+# release); a partial release is resumed. nightly/latest are mutable.
+#
+# Publication is serialized across ALL publishers (this workflow AND
+# publish.yml) by ONE shared workflow-level concurrency group (A2),
+# cancel-in-progress: false.
+
 name: Release (tag push)
+
+concurrency:
+  # SHARED publication lock - the SAME constant group in publish.yml (see its
+  # header for why a constant, version-independent key is required).
+  group: omd-labs-publication
+  cancel-in-progress: false
 
 on:
   push:
@@ -19,6 +43,11 @@ on:
         description: 'Version to (re)publish, without the v prefix, e.g. 5.81'
         type: string
         required: true
+      force_latest:
+        description: 'Override the :latest guard and re-point :latest to this version regardless (use for out-of-order releases or to force a re-point)'
+        type: boolean
+        required: false
+        default: false
       debug_enabled:
         type: boolean
         description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
@@ -27,12 +56,277 @@ on:
 
 env:
   # workflow_dispatch input (bare, e.g. 5.81); on tag pushes this is empty
-  # and the jobs derive the version from GITHUB_REF_NAME instead
+  # and the jobs derive the version from the pushed tag instead.
   VERSION: ${{ inputs.version }}
+  FORCE_LATEST: ${{ inputs.force_latest }}
 
 jobs:
+  # resolve version -> checkout ref + record the source commit (A1)
+  resolve:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      ver: ${{ steps.r.outputs.ver }}
+      ref: ${{ steps.r.outputs.ref }}
+      commit: ${{ steps.c.outputs.commit }}
+    steps:
+      - name: Resolve version
+        id: r
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            ver="${GITHUB_REF_NAME#v}"      # v5.81 -> 5.81
+          else
+            ver="$VERSION"
+          fi
+          # strict input validation (A5): bare numeric version only.
+          case "$ver" in
+            "") echo "::error::empty version - expected a bare version like 5.81 (no 'v' prefix)"; exit 1;;
+          esac
+          if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::invalid version '$ver' - expected a bare numeric version like 5.81 (no 'v' prefix, no branch name)"
+            exit 1
+          fi
+          echo "ver=$ver"  >> "$GITHUB_OUTPUT"
+          echo "ref=v$ver" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Release::version $ver, checkout ref v$ver"
+
+      - name: Check the tag exists (named failure)
+        run: |
+          # Without this, a missing ref dies in actions/checkout with a raw
+          # `git fetch` error. Tag pushes carry their own tag by definition;
+          # the manual leg can still name a version whose tag was never
+          # pushed, so the guard is meaningful there. Public repo: anonymous
+          # ls-remote, no secrets needed.
+          # NOTE: the full repo URL, NOT the `origin` remote - this step runs
+          # BEFORE actions/checkout, where there is no repo and no remote yet.
+          set -euo pipefail
+          repo=https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge.git
+          # rc=2 (refs listed, none matched) = genuinely missing; any other
+          # rc = lookup failure (network etc.) - reported as such, not as
+          # "tag does not exist". (Same handling as publish's ref guard;
+          # the if-conditional context keeps set -e from firing before
+          # rc=$? can capture the status.)
+          if git ls-remote --exit-code "$repo" "refs/tags/v${{ steps.r.outputs.ver }}" >/dev/null 2>&1; then
+            echo "::notice title=Release::tag v${{ steps.r.outputs.ver }} exists - proceeding"
+          else
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::tag v${{ steps.r.outputs.ver }} does not exist - push it first, e.g. \`git tag v${{ steps.r.outputs.ver }} <commit> && git push origin v${{ steps.r.outputs.ver }}\`"
+            else
+              echo "::error::could not LIST refs of $repo (git ls-remote rc=$rc) - lookup failure, NOT a missing-tag verdict"
+            fi
+            exit 1
+          fi
+
+      - name: Check out the repo (the release tag)
+        uses: actions/checkout@v7
+        with:
+          # the tag (A1: the build content is the tag's tree, not the event's
+          # default-branch context): the resolved, validated step output - NOT
+          # a self-reference to this job's own outputs
+          ref: v${{ steps.r.outputs.ver }}
+
+      - name: Record the source revision
+        id: c
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "commit=$sha" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Release::source revision $sha (ref v${{ steps.r.outputs.ver }})"
+
+  # v* no-overwrite guard (A3) + current :latest version metadata (A4).
+  # Authenticated GHCR reads only: 12 artifacts for the candidate v<ver>
+  # (8 arch tags + 4 final indexes; per-arch outputs gate the build steps,
+  # per-index outputs the manifest steps), plus the current :latest's
+  # version read from the CONFIG BLOB label of its amd64 image
+  # (org.opencontainers.image.omd_version - labels are NOT in the manifest
+  # JSON). ANY auth / network / non-404 error -> FAIL (fail safe). Runs
+  # under the shared A2 lock. Unlike the publish.yml guard, this job is
+  # UNCONDITIONAL (a release always needs the check) and therefore has no
+  # skip-cascade risk.
+  release_guard:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: read
+    outputs:
+      arch_omd_rocky_amd64:  ${{ steps.g.outputs.arch_omd_rocky_amd64 }}
+      arch_omd_rocky_arm64:  ${{ steps.g.outputs.arch_omd_rocky_arm64 }}
+      arch_omd_debian_amd64: ${{ steps.g.outputs.arch_omd_debian_amd64 }}
+      arch_omd_debian_arm64: ${{ steps.g.outputs.arch_omd_debian_arm64 }}
+      arch_base_rocky_amd64: ${{ steps.g.outputs.arch_base_rocky_amd64 }}
+      arch_base_rocky_arm64: ${{ steps.g.outputs.arch_base_rocky_arm64 }}
+      arch_base_debian_amd64: ${{ steps.g.outputs.arch_base_debian_amd64 }}
+      arch_base_debian_arm64: ${{ steps.g.outputs.arch_base_debian_arm64 }}
+      idx_omd_rocky:   ${{ steps.g.outputs.idx_omd_rocky }}
+      idx_omd_debian:  ${{ steps.g.outputs.idx_omd_debian }}
+      idx_base_rocky:  ${{ steps.g.outputs.idx_base_rocky }}
+      idx_base_debian: ${{ steps.g.outputs.idx_base_debian }}
+      all_exist:       ${{ steps.g.outputs.all_exist }}
+      latest_exists:   ${{ steps.g.outputs.latest_exists }}
+      latest_version:  ${{ steps.g.outputs.latest_version }}
+    steps:
+      - name: Check existing release artifacts + current :latest version
+        id: g
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: v${{ needs.resolve.outputs.ver }}
+        run: |
+          set -euo pipefail
+          ORG=consol-monitoring
+          PFX=omd-labs-systemd-vm-forge
+          ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+          # GHCR bearer token from the workflow credentials (no personal
+          # token). The distribution token spec separates SCOPES by repeated
+          # `scope=` URL parameters - a single comma-joined value is
+          # non-standard, so request them explicitly (pull-only, all four
+          # image paths) + the service param.
+          TOKEN=$(curl -fsS -G -u "$GH_ACTOR:$GH_TOKEN" \
+            --data-urlencode "service=ghcr.io" \
+            --data-urlencode "scope=repository:$ORG/$PFX/omd-labs-systemd-vm-rocky:pull" \
+            --data-urlencode "scope=repository:$ORG/$PFX/omd-labs-systemd-vm-debian:pull" \
+            --data-urlencode "scope=repository:$ORG/$PFX/omd-labs-systemd-vm-base-rocky:pull" \
+            --data-urlencode "scope=repository:$ORG/$PFX/omd-labs-systemd-vm-base-debian:pull" \
+            "https://ghcr.io/token" \
+            | jq -r .token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "::error::GHCR token exchange failed - failing safe"; exit 1; }
+          # check <image> <tag> -> 0 exists / 1 absent(404) / fail otherwise.
+          # Named `check` on purpose: the old local function was named
+          # `head`, which SHADOWED the external `head` binary inside this
+          # step and corrupted the :latest metadata pipeline below.
+          check() {
+            local code
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+              "https://ghcr.io/v2/$ORG/$PFX/$1/manifests/$2")
+            case $code in
+              200) return 0;;
+              404) return 1;;
+              *) echo "::error::existence check $1:$2 -> HTTP $code (failing safe)"; exit 1;;
+            esac
+          }
+          # 12 artifacts: 8 arch tags (gate the build steps) + 4 final
+          # indexes (gate the manifest steps). Per-arch granularity lets an
+          # interrupted release RESUME without re-pushing retained arch
+          # layers; all_exist is true only when ALL 12 are present.
+          all_exist=true
+          for os in rocky debian; do
+            for kind in base omd; do
+              if [ "$kind" = base ]; then IMG=omd-labs-systemd-vm-base-$os; else IMG=omd-labs-systemd-vm-$os; fi
+              for plat in amd64 arm64; do
+                if check "$IMG" "$CANDIDATE-$plat"; then
+                  echo "arch_${kind}_${os}_${plat}=true" >> "$GITHUB_OUTPUT"
+                else
+                  echo "arch_${kind}_${os}_${plat}=false" >> "$GITHUB_OUTPUT"
+                  all_exist=false
+                  echo "::notice title=Release::$IMG:$CANDIDATE-$plat absent - will (re)build this arch layer"
+                fi
+              done
+              if check "$IMG" "$CANDIDATE"; then
+                echo "idx_${kind}_${os}=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "idx_${kind}_${os}=false" >> "$GITHUB_OUTPUT"
+                all_exist=false
+                echo "::notice title=Release::$IMG:$CANDIDATE absent - will (re)assemble this index"
+              fi
+            done
+          done
+          echo "all_exist=$all_exist" >> "$GITHUB_OUTPUT"
+          # Current :latest version (A4). The omd_version label lives in the
+          # image CONFIG BLOB (config.Labels), NOT in any manifest JSON -
+          # the old code jq'd the manifest and always read empty. Path: the
+          # multi-arch :latest INDEX (the OMD rocky image) -> its amd64
+          # entry's manifest -> that manifest's config descriptor digest ->
+          # the config blob -> Labels. The amd64 entry is probed because the
+          # OMD rocky :latest is always assembled with both arches, and its
+          # config is labeled; the per-arch layer tags are NOT a stable
+          # lineage to probe (the `latest` channel writes <tag>-<plat> with
+          # tag=latest, releases write v<ver>-<plat>).
+          latest_exists=false; latest_version=""
+          idx_f=$(mktemp); man_f=$(mktemp); cfg_f=$(mktemp)
+          icode=$(curl -sL -o "$idx_f" -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+            "https://ghcr.io/v2/$ORG/$PFX/omd-labs-systemd-vm-rocky/manifests/latest")
+          if [ "$icode" = "200" ]; then
+            latest_exists=true
+            # The index ENTRY is a manifest DESCRIPTOR: its manifest digest
+            # is `.digest` (OCI image-index spec) - the CONFIG descriptor
+            # exists only inside the fetched manifest. (First implementation
+            # read `.config.digest` from the entry: empty for every real
+            # index -> A4 always "unknown" -> refused normal promotion.)
+            man_digest=$(jq -r '[.manifests[]? | select(.platform.architecture == "amd64" and .platform.os == "linux")] | .[0].digest // empty' "$idx_f")
+            if [ -n "$man_digest" ]; then
+              mcode=$(curl -sL -o "$man_f" -w '%{http_code}' \
+                -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+                "https://ghcr.io/v2/$ORG/$PFX/omd-labs-systemd-vm-rocky/manifests/$man_digest")
+              if [ "$mcode" != "200" ]; then
+                echo "::error:::latest amd64 entry manifest (digest $man_digest) -> HTTP $mcode (failing safe)"; exit 1
+              fi
+              cfgdigest=$(jq -r '.config.digest // empty' "$man_f")
+              if [ -n "$cfgdigest" ]; then
+                # -L: the distribution spec allows registry redirects;
+                # GHCR keeps the host (ghcr.io), so following with the
+                # Authorization header is same-host only.
+                ccode=$(curl -sL -o "$cfg_f" -w '%{http_code}' \
+                  -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.config.v1+json,application/vnd.docker.container.image.v1+json" \
+                  "https://ghcr.io/v2/$ORG/$PFX/omd-labs-systemd-vm-rocky/blobs/$cfgdigest")
+                if [ "$ccode" != "200" ]; then
+                  echo "::error:::latest config blob (digest $cfgdigest) -> HTTP $ccode (failing safe)"; exit 1
+                fi
+                latest_version=$(jq -r '.config.Labels["org.opencontainers.image.omd_version"] // empty' "$cfg_f" 2>/dev/null || true)
+                # the OMD :latest label is `v<maj>.<min>` when written by the
+                # release promotion (see the OMD build labels) and literally
+                # `latest` when written by the publish LATEST channel (the
+                # resolved input, not a version) - strip a leading v so the
+                # calc step's numeric compare sees the same form in the
+                # release case; `latest` stays non-numeric and therefore
+                # requires force_latest (the retained unknown-metadata
+                # policy).
+                latest_version=${latest_version#v}
+              else
+                echo "::notice title=Release:::latest amd64 manifest has no config descriptor - treating :latest version as unknown"
+              fi
+            else
+              echo "::notice title=Release:::latest index has no amd64 entry - treating :latest version as unknown"
+            fi
+          elif [ "$icode" != "404" ]; then
+            echo "::error:::latest index check -> HTTP $icode (failing safe)"; exit 1
+          fi
+          rm -f "$idx_f" "$man_f" "$cfg_f"
+          # unknown-but-present :latest: the calc step will NOT promote
+          # unless forced (deliberate policy - no silent downgrade).
+          echo "latest_exists=$latest_exists" >> "$GITHUB_OUTPUT"
+          echo "latest_version=$latest_version" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Release::candidate $CANDIDATE all_exist=$all_exist; :latest exists=$latest_exists version='${latest_version:-<none>}'"
+
+      # Run summary for the all-exist case: distinguishes "release
+      # artifacts unchanged" (no rebuild, no v-manifest re-push) from
+      # "nothing published" (the :latest step below may STILL re-point
+      # :latest if the A4 guard permits it - that is not an artifact write
+      # to the immutable v* release).
+      - name: Summary - release artifacts unchanged
+        if: ${{ steps.g.outputs.all_exist == 'true' }}
+        run: |
+          # GitHub substitutes workflow expressions ANYWHERE in the run
+          # string BEFORE the shell executes - including inside shell
+          # comments - so this comment deliberately avoids quoting the
+          # delimiters. The heredoc's quoting is irrelevant to that
+          # substitution; step g's CANDIDATE env is step-scoped (not
+          # available here).
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Release artifacts unchanged
+          All 12 artifacts of \`v${{ needs.resolve.outputs.ver }}\` (8 arch
+          tags + 4 final indexes) already exist in GHCR - nothing was
+          rebuilt or re-pushed (v* no-overwrite, A3). The \`:latest\` step
+          may still run: it re-points \`:latest\` (a mutable tag) and is
+          gated by the A4 promotion guard, not by no-overwrite.
+          EOF
+
   docker_build:
     runs-on: ${{ matrix.target.runs }}
+    needs: [resolve, release_guard]
     permissions:
       packages: write
       contents: read
@@ -48,22 +342,13 @@ jobs:
           - runs: ubuntu-24.04-arm
             platform: arm64
     steps:
-      - name: Resolve version and tag
-        id: r
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            ver="${GITHUB_REF_NAME#v}"      # v5.81 -> 5.81
-          else
-            ver="$VERSION"
-          fi
-          case "$ver" in *[!0-9.]*|"") echo "::error::invalid version '$ver' (expected e.g. 5.81)"; exit 1;; esac
-          echo "ver=$ver" >> "$GITHUB_OUTPUT"
-          echo "::notice title=Release::publishing v$ver (and re-pointing latest)"
-
-      - name: Check out the repo (the release tag)
+      - name: Check out the repo (pinned to the recorded commit)
         uses: actions/checkout@v7
         with:
-          ref: v${{ steps.r.outputs.ver }}
+          # A1, pinned to the COMMIT recorded by resolve - not the
+          # tag ref, which is not moving for tags but the pin makes
+          # the A1 guarantee explicit and identical to the label.
+          ref: ${{ needs.resolve.outputs.commit }}
 
       # Docker Hub publishing is disabled for now; images go to GHCR only.
       # - name: Log in to Docker Hub
@@ -76,9 +361,6 @@ jobs:
         uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
-          # built-in workflow token (short-lived, per-run; the job's
-          # "permissions: packages: write" grants the GHCR push) - no
-          # personal account, no stored secret
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
@@ -86,31 +368,81 @@ jobs:
         uses: mxschmitt/action-tmate@v3
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
 
-      # the release tag only; :latest is created by the manifest job so
-      # the multi-arch manifest can carry both names in one go
-      - name: Build and Push
+      # the OMD-preinstalled image (v<ver> arch tag only; :latest is created
+      # by the manifest job so the manifest can carry both names in one go).
+      - name: Build and Push OMD (arch layer)
+        # PER-ARCH skip (the guard runs unconditionally here): a retained
+        # v* arch layer is never re-pushed, even on a resume of a partial
+        # release. Single line on purpose: an indented multi-line `if: >-`
+        # block keeps literal newlines inside the expression and does not
+        # fold (the old wrapped form is not unambiguously a single
+        # expression).
+        if: ${{ !(needs.release_guard.outputs.arch_omd_rocky_amd64 == 'true' && matrix.os == 'rocky' && matrix.target.platform == 'amd64') && !(needs.release_guard.outputs.arch_omd_rocky_arm64 == 'true' && matrix.os == 'rocky' && matrix.target.platform == 'arm64') && !(needs.release_guard.outputs.arch_omd_debian_amd64 == 'true' && matrix.os == 'debian' && matrix.target.platform == 'amd64') && !(needs.release_guard.outputs.arch_omd_debian_arm64 == 'true' && matrix.os == 'debian' && matrix.target.platform == 'arm64') }}
         uses: docker/build-push-action@v7
         with:
-          push: true
+          context: .
           file: Dockerfile.omd-labs-systemd-vm-${{ matrix.os }}
+          target: omd
+          push: true
+          platforms: linux/${{ matrix.target.platform }}
           sbom: false
           provenance: false
           build-args: |
-            OMD_VERSION=${{ steps.r.outputs.ver }}
+            OMD_VERSION=${{ needs.resolve.outputs.ver }}
             INSTALL_COMMON_RETRIES=3
             BUILDKIT_MULTI_PLATFORM=0
-          # Docker Hub publishing is disabled for now (GHCR only). The
-          # disabled tag is kept OUT of the tags block on purpose: the
-          # build-push action passes every line of the block to buildx,
-          # so a comment line there becomes an invalid tag.
-          # consol/omd-labs-systemd-vm-${{ matrix.os }}:v${{ steps.r.outputs.ver }}-${{ matrix.target.platform }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
+            org.opencontainers.image.source=https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge
+            org.opencontainers.image.omd_version=v${{ needs.resolve.outputs.ver }}
+          # Docker Hub publishing is disabled for now (GHCR only).
+          # consol/omd-labs-systemd-vm-${{ matrix.os }}:v${{ needs.resolve.outputs.ver }}-${{ matrix.target.platform }}
           tags: |
-            ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:v${{ steps.r.outputs.ver }}-${{ matrix.target.platform }}
+            ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}:v${{ needs.resolve.outputs.ver }}-${{ matrix.target.platform }}
+
+      # the OMD-less chassis (base stage) - v<ver> arch tag, same no-overwrite.
+      - name: Build and Push base (chassis, arch layer)
+        if: ${{ !(needs.release_guard.outputs.arch_base_rocky_amd64 == 'true' && matrix.os == 'rocky' && matrix.target.platform == 'amd64') && !(needs.release_guard.outputs.arch_base_rocky_arm64 == 'true' && matrix.os == 'rocky' && matrix.target.platform == 'arm64') && !(needs.release_guard.outputs.arch_base_debian_amd64 == 'true' && matrix.os == 'debian' && matrix.target.platform == 'amd64') && !(needs.release_guard.outputs.arch_base_debian_arm64 == 'true' && matrix.os == 'debian' && matrix.target.platform == 'arm64') }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.omd-labs-systemd-vm-${{ matrix.os }}
+          target: base
+          push: true
           platforms: linux/${{ matrix.target.platform }}
+          sbom: false
+          provenance: false
+          build-args: |
+            INSTALL_COMMON_RETRIES=3
+            BUILDKIT_MULTI_PLATFORM=0
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.commit }}
+            org.opencontainers.image.source=https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge
+            org.opencontainers.image.flavor=base
+          tags: |
+            ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-base-${{ matrix.os }}:v${{ needs.resolve.outputs.ver }}-${{ matrix.target.platform }}
+
+      # A5: log the installed OMD package version for THIS architecture.
+      - name: Log installed OMD package version (per arch)
+        run: |
+          OS=${{ matrix.os }}
+          PLAT=${{ matrix.target.platform }}
+          TAG=v${{ needs.resolve.outputs.ver }}
+          IMG="ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-$OS:$TAG-$PLAT"
+          if [ "$OS" = "rocky" ]; then
+            ver=$(docker run --rm "$IMG" sh -c "rpm -qa | grep -iE '^omd' | sort || echo '(no omd packages)'" 2>/dev/null) \
+              || ver="(arch image not pullable - see build log)"
+          else
+            ver=$(docker run --rm "$IMG" sh -c "dpkg -l | grep -iE '^ii +omd' | awk '{print \$1, \$2}' | sort || echo '(no omd packages)'" 2>/dev/null) \
+              || ver="(arch image not pullable - see build log)"
+          fi
+          echo "Installed OMD packages ($OS, linux/$PLAT):"
+          echo "$ver"
+          echo "::notice title=OMD package ($OS, linux/$PLAT)::$ver"
 
   manifest:
     runs-on: ubuntu-24.04
-    needs: docker_build
+    needs: [resolve, release_guard, docker_build]
     permissions:
       packages: write
       contents: read
@@ -121,35 +453,18 @@ jobs:
           - rocky
           - debian
     steps:
-      - name: Resolve version and tag
-        id: r
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            ver="${GITHUB_REF_NAME#v}"
-          else
-            ver="$VERSION"
-          fi
-          echo "ver=$ver" >> "$GITHUB_OUTPUT"
-          echo "::notice title=Release::publishing v$ver (and re-pointing latest)"
-
-      - uses: actions/checkout@v7
+      - name: Check out the repo (pinned to the recorded commit)
+        uses: actions/checkout@v7
         with:
-          ref: v${{ steps.r.outputs.ver }}
-
-      # Docker Hub publishing is disabled for now; images go to GHCR only.
-      # - name: Log in to Docker Hub
-      #   uses: docker/login-action@v4.8.0
-      #   with:
-      #     username: ${{ secrets.DOCKER_USERNAME }}
-      #     password: ${{ secrets.DOCKER_PASSWORD }}
+          # A1, pinned to the COMMIT recorded by resolve - not the
+          # tag ref, which is not moving for tags but the pin makes
+          # the A1 guarantee explicit and identical to the label.
+          ref: ${{ needs.resolve.outputs.commit }}
 
       - name: Log in to GitHub Docker Registry
         uses: docker/login-action@v4.8.0
         with:
           registry: ghcr.io
-          # built-in workflow token (short-lived, per-run; the job's
-          # "permissions: packages: write" grants the GHCR push) - no
-          # personal account, no stored secret
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
@@ -157,22 +472,84 @@ jobs:
         uses: mxschmitt/action-tmate@v3
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
 
-      # Docker Hub publishing is disabled for now; images go to GHCR only.
-      # - name: push manifest to dockerhub
-      #   run: |
-      #       docker manifest create consol/omd-labs-systemd-vm-${{ matrix.os }}:v${{ steps.r.outputs.ver }} \
-      #                              consol/omd-labs-systemd-vm-${{ matrix.os }}:v${{ steps.r.outputs.ver }}-amd64 \
-      #                              consol/omd-labs-systemd-vm-${{ matrix.os }}:v${{ steps.r.outputs.ver }}-arm64
-      #       docker manifest push consol/omd-labs-systemd-vm-${{ matrix.os }}:v${{ steps.r.outputs.ver }}
+      # A4: decide whether to re-point :latest to this candidate.
+      # Promote only if: force_latest override, OR :latest absent (first
+      # release), OR candidate > current :latest (NUMERIC compare - not git-tag
+      # sort, not "highest v*"). A present-but-unlabeled :latest (unknown
+      # metadata) must NOT silently pass - do not promote unless forced.
+      # NOTE: a :latest written by the publish LATEST channel carries the
+      # label value `latest` (the resolved input, not a number) - it is
+      # non-numeric by design and therefore requires force_latest; that is
+      # the retained unknown-metadata policy, not a parsing defect.
+      - name: :latest promotion guard (A4)
+        id: calc
+        run: |
+          set -euo pipefail
+          CANDIDATE=${{ needs.resolve.outputs.ver }}   # bare, e.g. 5.81
+          LATEST_EXISTS=${{ needs.release_guard.outputs.latest_exists }}
+          LATEST_VERSION=${{ needs.release_guard.outputs.latest_version }}
+          FORCE=${{ inputs.force_latest }}
+          promote=false; reason=""
+          if [ "$FORCE" = "true" ]; then
+            promote=true; reason="force_latest override (operator)"
+          elif [ "$LATEST_EXISTS" != "true" ]; then
+            promote=true; reason=":latest absent (first release)"
+          elif [[ ! "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            promote=false; reason="current :latest version unknown/non-numeric - NOT promoting (use force_latest to override)"
+          else
+            cmaj=${CANDIDATE%%.*}; cmin=${CANDIDATE##*.}
+            lmaj=${LATEST_VERSION%%.*}; lmin=${LATEST_VERSION##*.}
+            if [ "$cmaj" != "$lmaj" ] && [ "$cmaj" -gt "$lmaj" ]; then
+              promote=true; reason="$CANDIDATE > :latest $LATEST_VERSION (numeric)"
+            elif [ "$cmaj" = "$lmaj" ] && [ "$cmin" -gt "$lmin" ]; then
+              promote=true; reason="$CANDIDATE > :latest $LATEST_VERSION (numeric)"
+            else
+              promote=false; reason="NOT promoting: $CANDIDATE is not newer than :latest $LATEST_VERSION (no downgrade)"
+            fi
+          fi
+          echo "promote=$promote" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Release:::latest promotion -> $promote ($reason)"
 
-      - name: push manifest to github (release tag + latest)
+      # the immutable v<ver> manifest - skip if the release is already fully
+      # published (no-overwrite); push for first publication / partial resume.
+      # PER-INDEX skip: if this final v* index already exists it is
+      # retained as-is (no re-push), even on a partial-resume run.
+      - name: push OMD v manifest to github
+        # case() selects this matrix arm's index output (GitHub expressions
+        # have no `? :` ternary operator).
+        if: ${{ !(case(matrix.os == 'rocky', needs.release_guard.outputs.idx_omd_rocky, needs.release_guard.outputs.idx_omd_debian) == 'true') }}
         run: |
             IMG=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}
-            docker manifest create "$IMG:v${{ steps.r.outputs.ver }}" \
-                                   "$IMG:v${{ steps.r.outputs.ver }}-amd64" \
-                                   "$IMG:v${{ steps.r.outputs.ver }}-arm64"
-            docker manifest push "$IMG:v${{ steps.r.outputs.ver }}"
-            docker manifest create "$IMG:latest" \
-                                   "$IMG:v${{ steps.r.outputs.ver }}-amd64" \
-                                   "$IMG:v${{ steps.r.outputs.ver }}-arm64"
+            docker manifest create "$IMG:v${{ needs.resolve.outputs.ver }}" \
+                                   "$IMG:v${{ needs.resolve.outputs.ver }}-amd64" \
+                                   "$IMG:v${{ needs.resolve.outputs.ver }}-arm64"
+            docker manifest push "$IMG:v${{ needs.resolve.outputs.ver }}"
+
+      # PER-INDEX skip, same rationale. THIS STEP WAS MISSING
+      # ENTIRELY before the 2026-11-15 fix: release.yml never created
+      # the base v<ver> multi-arch index, so a fresh release could
+      # never reach its own all-exist state (the guard's idx_base_*
+      # checks could only be satisfied by a publish.yml v* run).
+      - name: push base v manifest to github
+        if: ${{ !(case(matrix.os == 'rocky', needs.release_guard.outputs.idx_base_rocky, needs.release_guard.outputs.idx_base_debian) == 'true') }}
+        run: |
+            IMG=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-base-${{ matrix.os }}
+            docker manifest create "$IMG:v${{ needs.resolve.outputs.ver }}" \
+                                   "$IMG:v${{ needs.resolve.outputs.ver }}-amd64" \
+                                   "$IMG:v${{ needs.resolve.outputs.ver }}-arm64"
+            docker manifest push "$IMG:v${{ needs.resolve.outputs.ver }}"
+
+      # re-point :latest to this release (gated by the A4 calc step above).
+      # For the OMD image and the base image (base :latest re-pointed under
+      # the same guard - the base has no OMD version, so its :latest is
+      # governed by the associated release, per A4).
+      - name: push :latest manifests to github (gated)
+        if: ${{ steps.calc.outputs.promote == 'true' }}
+        run: |
+            IMG=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-${{ matrix.os }}
+            BIMG=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-base-${{ matrix.os }}
+            V=v${{ needs.resolve.outputs.ver }}
+            docker manifest create "$IMG:latest" "$IMG:$V-amd64" "$IMG:$V-arm64"
             docker manifest push "$IMG:latest"
+            docker manifest create "$BIMG:latest" "$BIMG:$V-amd64" "$BIMG:$V-arm64"
+            docker manifest push "$BIMG:latest"

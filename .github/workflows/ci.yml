@@ -73,10 +73,15 @@ jobs:
         uses: mxschmitt/action-tmate@v3
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
 
-      # test build only: no registry login, no push
+      # test build only: no registry login, no push.
+      # context: . pins the build to THIS checkout (A1 hardening): without it
+      # buildx defaults to the trigger event's git ref, so a pull_request would
+      # build the merge ref's files instead of the PR head's (the PR's own
+      # Dockerfile/scripts edits would not be the ones tested).
       - name: Build (no push)
         uses: docker/build-push-action@v7
         with:
+          context: .
           push: false
           file: Dockerfile.omd-labs-systemd-vm-${{ matrix.os }}
           sbom: false

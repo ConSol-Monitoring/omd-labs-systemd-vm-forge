@@ -145,6 +145,56 @@ Alternatively, `make -f Makefile.omd-labs-systemd-vm-rocky build` builds the loc
 Docker image using the branch-derived tag (`master` → `nightly`). The Make
 build hook always invokes Docker.
 
+### The base image (no OMD)
+
+There is also an **OMD-less chassis image** per distro:
+`local/omd-labs-systemd-vm-base-rocky:nightly` /
+`local/omd-labs-systemd-vm-base-debian:nightly`. It is the *foundation* of
+the image above (that image is built `FROM` the same base stage) and exists
+for users who want the VM-like chassis — systemd as PID 1, the edge + sshd
++ cron, a bounded readiness gate, and **both** `labs.consol.de` channels
+configured — **without a baked-in OMD version**, so they can install *any*
+OMD release (stable / daily / versioned) and build their own derived image.
+
+```bash
+# build the chassis (the Dockerfile's `base` stage)
+docker build -f Dockerfile.omd-labs-systemd-vm-rocky --target base \
+  -t local/omd-labs-systemd-vm-base-rocky:nightly .
+# Make: make -f Makefile.omd-labs-systemd-vm-rocky build FLAVOR=base
+```
+
+Two ways to get a working OMD from it (the README's *The base image*
+section documents both; the verification suite covers the derived-image
+variant, S11b):
+
+1. **Preferred — a derived image** (build-time install, reproducible):
+
+   ```dockerfile
+   FROM local/omd-labs-systemd-vm-base-rocky:nightly
+   ADD ./scripts/install_omd.sh /tmp/install_omd.sh
+   RUN chmod +x /tmp/install_omd.sh && /tmp/install_omd.sh rocky latest
+   ```
+
+   (then the same post-install normalization the OMD Dockerfile stage
+   applies — vendor `omd.service` enablement dropped, the `/etc` alias and
+   edge/cron/sshd enablement re-asserted — see `Dockerfile.omd-labs-
+   systemd-vm-rocky`, stage `omd`). Run the derived image with
+   `SITENAME=…` exactly like the image above.
+
+2. **Runtime install** (operator variant): run the base with **no**
+   `SITENAME` (`--privileged`; `--systemd=always` on Podman), wait for
+   readiness, then inside the running container `dnf install
+   omd-labs-edition` (or `apt-get install omd-labs-edition`, or the
+   versioned/daily package name), run the same normalization, and create
+   the site manually with `omd`. That site is a *manual* site — stop it
+   explicitly before stopping the container.
+
+The base **refuses a site request without OMD**: starting it with
+`SITENAME=demo` fails fast (exit 1 in under 5 s, named cause in
+`/var/log/omd-labs/entry-fatal`) and leaves no partial site directory.
+No-site, the edge answers **403** on Rocky / **200** on Debian (the Apache
+base response — the readiness gate has already verified the listeners).
+
 **Podman users:** replace `docker build` with `podman build`. Docker and
 Podman have separate image/container stores; build or pull the image using
 the engine you will run it with. For Make runtime targets (`start`,
