@@ -66,7 +66,8 @@ see *Choosing a site* below.
 |---|---|
 | **`--privileged`** (Docker *and* Podman) | systemd-as-PID 1 needs full capabilities / rw cgroups + `/sys` |
 | **`--systemd=always`** (Podman only) | the image's `CMD` is a pre-init bootstrap wrapper, not literally `/sbin/init`, so Podman's systemd auto-mode (tmpfs `/run`, `/run/lock`, `/tmp`, `/var/lib/journal`, writable cgroup-v2 fs) must be forced |
-| **cgroup v2 host** | the target systemd versions (252/257) refuse cgroup v1 |
+| **cgroup v2 host** | the target systemd version (257) refuses cgroup v1 |
+| **x86-64-v3 CPU** (amd64 image) | the Rocky 10 amd64 userspace requires the x86-64-v3 instruction set; a host or VM exposing an older CPU model fails in userspace before any container diagnostic (VMs: expose a compatible CPU model) |
 
 Docker has no `--systemd` mode — nothing to add there.
 
@@ -505,7 +506,7 @@ below come from a **local build** — build one first (branch-derived tag:
 `master` ⇒ `nightly`):
 
 ```bash
-make -f Makefile.omd-labs-systemd-vm-rocky build          # Rocky 9 (OMD image)
+make -f Makefile.omd-labs-systemd-vm-rocky build          # Rocky 10 (OMD image)
 make -f Makefile.omd-labs-systemd-vm-debian build         # Debian 13 (OMD image)
 # the OMD-less chassis (base) image:
 make -f Makefile.omd-labs-systemd-vm-rocky build FLAVOR=base    # -> local/omd-labs-systemd-vm-base-rocky:<TAG>

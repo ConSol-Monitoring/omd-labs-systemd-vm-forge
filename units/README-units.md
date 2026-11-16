@@ -22,7 +22,7 @@ this document is what the T012/T029 audits assert against.
 
 ## Final enabled set per distro (the audit assertion, T012/T029)
 
-**Rocky 9** — enabled exactly (plus distro defaults):
+**Rocky 10** — enabled exactly (plus distro defaults):
 
 - `httpd.service` — the system web edge (443/80), **required** (FR-002); pre-enabled by the OMD package
 - `sshd.service` — **required** (FR-003 — the v2 inversion: v1 disabled it)

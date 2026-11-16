@@ -23,7 +23,11 @@
 ###############################################################################
 # stage: base — the OMD-less chassis
 ###############################################################################
-FROM rockylinux:9 AS base
+# Rocky Linux 10 base (fully qualified: `docker.io/library/rockylinux` has NO
+# `10` tag — the R10 base lives in the vendor `docker.io/rockylinux/rockylinux`
+# repo; an unqualified `rockylinux:10` would resolve to the nonexistent library
+# image or a local `rockylinux:10` image, not the Rocky 10 base).
+FROM docker.io/rockylinux/rockylinux:10 AS base
 LABEL org.opencontainers.image.authors="Lassi"
 LABEL org.opencontainers.image.source="https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge"
 EXPOSE 80 443 22 4730 5666
@@ -46,9 +50,10 @@ RUN chmod +x $HOME/install_*.sh
 RUN $HOME/install_retry.sh -r $INSTALL_COMMON_RETRIES -d 30 -- $HOME/install_common.sh rocky
 
 #### edge + probe dependencies (chassis-owned, no OMD) ####
-# EMPIRICAL (2026-11-15 probe): rockylinux:9 ships NEITHER systemd NOR
-# /sbin/init (both arrived via the OMD package in the single-stage image).
-# The base owns them so systemd-as-PID1 + the init assertion hold with no OMD.
+# EMPIRICAL (2026-11-15 probe, re-confirmed 2026-11-16 on rockylinux:10):
+# rockylinux:10 ships NEITHER systemd NOR /sbin/init (both arrived via the OMD
+# package in the single-stage image). The base owns them so systemd-as-PID1 +
+# the init assertion hold with no OMD.
 # httpd + mod_ssl: the HTTPS edge (the OMD package used to supply it — the
 # base owns it now so a no-OMD boot reaches the ready gate).
 # iproute: the ready gate's listener check uses `ss` (omd-ready-check
@@ -83,8 +88,8 @@ RUN mkdir -p /etc/pki/tls/certs /etc/pki/tls/private \
 # package installed. The repo RPMs carry the GPG config (gpgcheck=1, key
 # auto-fetched from the vendor); install_common.sh's `dnf -y update` above
 # already validated both repos' metadata.
-RUN rpm -Uvh "https://labs.consol.de/repo/stable/rhel9/x86_64/labs-consol-stable.rhel9.noarch.rpm" \
-    && rpm -Uvh "https://labs.consol.de/repo/testing/rhel9/x86_64/labs-consol-testing.rhel9.noarch.rpm" \
+RUN rpm -Uvh "https://labs.consol.de/repo/stable/rhel10/x86_64/labs-consol-stable.rhel10.noarch.rpm" \
+    && rpm -Uvh "https://labs.consol.de/repo/testing/rhel10/x86_64/labs-consol-testing.rhel10.noarch.rpm" \
     && dnf clean all
 # loud build-time assertions: both channels are enabled and carry OMD
 # packages (the "any version installable" contract).
@@ -147,7 +152,7 @@ RUN sed -i -e 's/@EDGE_UNIT@/httpd.service/' -e 's/@SSH_UNIT@/sshd.service/' /us
 #     (2) the Alias= is INERT until enablement — an unactivated Alias=
 #         resolves to nothing (debate/101 F3), hence the loud build-time
 #         assertion below;
-#     (3) systemd 252 (Rocky) has no `systemctl enable --alias` — the
+#     (3) systemd 252 (Rocky 9) has no `systemctl enable --alias` — the
 #         unit-file Alias= is the version-independent mechanism
 #         (debate/102 E4).
 #   On the OMD stage the package pre-enables omd.service (a
