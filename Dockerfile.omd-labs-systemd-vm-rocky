@@ -61,9 +61,11 @@ RUN $HOME/install_retry.sh -r $INSTALL_COMMON_RETRIES -d 30 -- $HOME/install_com
 # healthy edge (EMPIRICAL 2026-11-14). cronie: crond runs OMD/site jobs.
 # sshd is enabled here (install_common.sh installs openssh-server but the
 # sshd ENABLEMENT used to come from the OMD package).
+# openssl: the edge self-signed cert below (EL10 delta: rockylinux:10 no
+# longer carries openssl by default — it was present implicitly on EL9).
 # The assertion below fails loudly at build time if a base/dependency change
 # ever breaks systemd-as-PID1 (research.md C2).
-RUN dnf -y install systemd httpd mod_ssl iproute cronie \
+RUN dnf -y install systemd httpd mod_ssl iproute cronie openssl \
     && systemctl enable sshd httpd crond \
     && test -x /sbin/init
 # a self-signed localhost certificate + a 443 vhost (the no-site edge
