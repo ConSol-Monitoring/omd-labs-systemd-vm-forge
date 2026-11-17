@@ -169,7 +169,11 @@ if [ -n "$OMD_VERSION" ]; then
     *) echo "WARNING: omd_version '$OMD_VERSION' is not a recognized channel (master/latest) or a version (X.YY); sending as-is." >&2;;
   esac
 fi
-[ -n "$OMD_VERSION" ] || { echo "ERROR: OMD_VERSION missing (env OMD_WEBHOOK_OMD_VERSION or --omd-version). Expected: master|latest|testing|stable|nightly|daily|X.YY" >&2; exit 2; }
+# the version is REQUIRED for a dispatch and for --dry-run (which displays
+# the payload); --check is a pure credentials path and needs none.
+if [ "$CHECK" = 0 ]; then
+  [ -n "$OMD_VERSION" ] || { echo "ERROR: OMD_VERSION missing (env OMD_WEBHOOK_OMD_VERSION or --omd-version). Expected: master|latest|testing|stable|nightly|daily|X.YY (not required with --check)" >&2; exit 2; }
+fi
 # a date-stamped daily (X.YY.ZZZ) is NOT an addressable version: the testing/
 # daily channel is addressed with omd_version=master (which installs the
 # CURRENT daily build). Reject it locally with guidance instead of letting
@@ -180,7 +184,9 @@ if [[ "$OMD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 # ---------- dry-run: print the plan, make no API calls ---------------------
-if [ "$DRY_RUN" = 1 ]; then
+# (--check is handled after the credential steps below; when both flags are
+# given, --check wins: it makes the real API calls that --dry-run avoids.)
+if [ "$DRY_RUN" = 1 ] && [ "$CHECK" = 0 ]; then
   echo "DRY RUN — no API calls."
   echo "  repo         : $REPO"
   echo "  endpoint     : POST $API/repos/$REPO/dispatches"
