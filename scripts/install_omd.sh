@@ -53,7 +53,13 @@ function install_omd_rocky() {
   # ("package ... is already installed"). Same version -> no-op reinstall;
   # a newer repo rpm -> normal upgrade. Fresh installs are unaffected.
   rpm -Uvh --replacepkgs "https://labs.consol.de/repo/${REPOVERSION}/rhel10/x86_64/labs-consol-${REPOVERSION}.rhel10.noarch.rpm"
-  yum update
+  # -y: non-interactive, symmetric with install_common.sh's `dnf -y update`.
+  # A bare `yum update` prompts "Is this ok [y/N]:" whenever a baseos
+  # point release landed in the mirror between the base stage's update pass
+  # and this layer (mirror sync skew) - with stdin at EOF in a build the
+  # prompt aborts the transaction (EMPIRICAL 2026-11-17: the el10_3.24
+  # util-linux release broke the amd64 master test build exactly here).
+  yum -y update
   yum -y install $PACKAGENAME
   test -f /usr/bin/ping && chmod +s /usr/bin/ping
 }
