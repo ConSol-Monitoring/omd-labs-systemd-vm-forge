@@ -10785,3 +10785,122 @@ omd status rc=0
 
 - PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
 - teardown done (derived image local/omd-labs-systemd-vm-s11b-debian:latest retained for inspection)
+## S11a-s11a-rocky
+- when: 2026-11-17 10:38:14
+- runtime: podman
+
+- **RESULT: PASS**
+
+- base image: local/omd-labs-systemd-vm-base-rocky:nightly (edge unit httpd, expect no-site HTTP 403)
+- PASS: base readiness within bound (gate active + 443 answers)
+```
+ready-time=2s rc=0
+```
+
+- PASS: omd-ready + httpd + sshd all active
+```
+ready=active edge=active ssh=active
+```
+
+- PASS: edge answers the EXACT no-site code (403) on 443
+```
+code=403
+```
+
+- PASS: ss (the ready-gate probe tool) is PRESENT - a named cause, not a silent 120 s deadline
+```
+ss at: /usr/sbin/ss
+```
+
+- PASS: the omd binary is ABSENT (OMD-less chassis)
+```
+omd absent (ok)
+```
+
+- PASS: sshd reachable from host on 18452
+- PASS: omd.service resolves to the omd-site alias
+```
+alias -> /usr/lib/systemd/system/omd-site.service
+```
+
+- PASS: both labs.consol.de channels configured (stable + testing)
+- PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- teardown done
+## S2-s2-rocky
+- when: 2026-11-17 10:38:24
+- runtime: podman
+
+- **RESULT: PASS**
+
+- PASS: readiness (gate active + /mysite/ answers 302/200)
+```
+ready-time=7s
+```
+
+- PASS: log shows prominent 'created new site mysite'
+- PASS: omd status mysite running (rc 0)
+```
+rrdcached:      running
+npcd:           running
+naemon:         running
+apache:         running
+crontab:        running
+-----------------------
+Overall state:  running
+```
+
+- PASS: site data on host volume (etc/var/local/version + init-complete marker, root probe)
+- PASS: 5 site daemons run as user mysite
+- PASS: HTTPS /mysite/ through the edge (host-side)
+```
+302
+```
+
+- site-start ready-time (first start): see 'readiness' evidence above; formal median-of-5 baseline = T034 (FR-018)
+- PASS: restart same container reaches ready again
+```
+omd-s2
+ready-time=3s
+```
+
+- PASS: log shows 'resumed existing site mysite' (no re-creation)
+- PASS: replacement container resumes (account absent in fresh image)
+```
+ready-time=4s
+```
+
+- PASS: replacement: 'resumed existing site mysite'
+- PASS: replacement: omd status mysite rc 0
+```
+rrdcached:      running
+npcd:           running
+naemon:         running
+apache:         running
+crontab:        running
+-----------------------
+Overall state:  running
+```
+
+- PASS: SC-002: concurrent site A ready (/s2siteA/ via published edge)
+```
+ready-time=7s
+```
+
+- PASS: SC-002: concurrent site B ready (gate active + /s2siteB/ on its own edge)
+```
+ready-time=7s
+```
+
+- PASS: SC-002: site A still serving WHILE B runs (no interference, both up)
+```
+302
+```
+
+- PASS: SC-002: omd status of BOTH sites rc 0 (independent site daemons)
+```
+A0
+B0
+```
+
+- PASS: SC-002: both volumes populated independently (root probe)
+- site-start reference ready-time: see readiness evidence above (formal median-of-5 = T034)

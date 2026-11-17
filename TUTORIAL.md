@@ -1,6 +1,6 @@
 # Tutorial: running the systemd-based OMD Labs container
 
-This tutorial covers the new Rocky Linux 9 and Debian 13 images. They boot
+This tutorial covers the new Rocky Linux 10 and Debian 13 images. They boot
 with **systemd as PID 1**, run system Apache and SSH, and optionally create
 one OMD monitoring site selected at runtime. Site data can outlive both a
 container restart and replacement with a fresh container.
