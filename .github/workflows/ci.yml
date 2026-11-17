@@ -33,6 +33,10 @@ env:
 
 jobs:
   docker_build:
+    # Speaking job name (2026-11-17): deliverable + distro + arch. The old
+    # auto-name surfaced the RUNNER (ubuntu-24.04) instead - which reads like
+    # an arch choice and hides what is actually built.
+    name: "test build omd image (no push): ${{ matrix.os }} ${{ matrix.target.platform }}"
     runs-on: ${{ matrix.target.runs }}
     permissions:
       contents: read

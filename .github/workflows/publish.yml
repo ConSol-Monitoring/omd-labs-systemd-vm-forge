@@ -310,6 +310,10 @@ jobs:
           EOF
 
   docker_build:
+    # Speaking job name (2026-11-17): deliverable + distro + arch. One job
+    # builds AND pushes BOTH arch layers (omd + base) for its distro/arch;
+    # the old auto-name surfaced the RUNNER (ubuntu-24.04) instead.
+    name: "build+push omd & base arch layers: ${{ matrix.os }} ${{ matrix.target.platform }}"
     runs-on: ${{ matrix.target.runs }}
     needs: resolve
     permissions:
@@ -443,6 +447,10 @@ jobs:
           echo "::notice title=OMD package ($OS, linux/$PLAT)::$ver"
 
   manifest:
+    # Speaking job name (2026-11-17): this job assembles AND pushes BOTH
+    # multi-arch indexes (omd + base) for its distro; the old auto-name
+    # said only "manifest".
+    name: "push manifests omd & base (multi-arch): ${{ matrix.os }}"
     runs-on: ubuntu-24.04
     needs: [resolve, docker_build]
     permissions:
