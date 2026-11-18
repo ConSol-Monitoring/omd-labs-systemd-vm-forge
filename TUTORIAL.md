@@ -92,6 +92,14 @@ password with `"$CONTAINER_RUNTIME" exec -it omd-qs su - qs -c set_admin_passwor
 then log in as **omdadmin**; see [section 2](#2-start-a-persistent-monitoring-site).
 The SSH key does not set the web password.
 
+Alternatively, set the web password at first creation by adding
+`-e OMD_ADMIN_PASSWORD=<pw>` to the run command (fresh creation or
+interrupted-creation recovery only — a site that already exists keeps its
+stored credential, so the variable is a first-creation convenience, not a
+rotation path; rotation of a committed site stays the `su - <site>` +
+`set_admin_password` flow below). Environment variables are visible via
+`podman inspect` and process listings, so treat the value accordingly.
+
 `systemctl status omd` shows the site's cached **active (exited)** unit through
 the alias of `omd-site`, not live daemon health. Use `omd status qs` as above;
 see [service administration](#6-ssh-and-service-administration).
@@ -280,6 +288,11 @@ set_admin_password
 exit
 ```
 
+This is the documented rotation path for a site that already exists. For a
+first creation you can instead pass `-e OMD_ADMIN_PASSWORD=<pw>` to the run
+command — see the [Quick Start](#quick-start); the stored credential of a
+committed site always wins, so the variable never rotates an existing site.
+
 Log in to the web applications as **omdadmin** with that password. Web
 credentials and root SSH credentials are separate. The bootstrap currently
 captures successful creation output, so do not rely on seeing the generated
@@ -308,6 +321,7 @@ Startup recognizes these user-facing environment variables:
 |---|---|
 | `SITENAME` | Select/create the site. Empty or absent means no site. |
 | `OMDCFG_<KEY>` | Set an OMD configuration key during first creation or interrupted-creation recovery. Example: `OMDCFG_MOD_GEARMAN=on`. |
+| `OMD_ADMIN_PASSWORD` | Set the `omdadmin` web password during site creation — fresh creation or interrupted-creation recovery only. **Committed sites keep their stored credential** (persisted, persisted-with-stale-marker, and adopted legacy are all committed); the variable is ignored for them. An exactly-empty value is a no-op (the generated random password stands); every non-empty value is applied **verbatim** (no trimming). Security note: environment variables are visible via `podman inspect` and process listings — this is a lab convenience, not a secret-management mechanism. |
 
 **`TMPFS=on` alone is not a startup setting. Use `OMDCFG_TMPFS=on`.**
 `OMD_SITE` is internal to OMD tooling, not the external site selector.

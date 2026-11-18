@@ -40,6 +40,18 @@ SITE_STATE=""          # created-fresh | persisted | recovered | adopted | none
 SITE_CUSTOM_APPLIED=0  # D9: 1 when the T026 customization was applied (row 1/3a)
 SITE_CUSTOM_SUMMARY="" # D9: the effective-customization summary line (FR-010)
 
+# OMD_ADMIN_PASSWORD: the site web credential (omdadmin) set at creation from the
+# run environment (web-admin-credential capability). Guard is EXACT emptiness only:
+# a non-empty value (including whitespace-only) is the operator's explicit choice and
+# is passed VERBATIM (no trimming/normalization). This is a read-only guard - it only
+# records that a value is present; the actual credential tool invocation happens inside
+# the two creation tails, so the non-overwrite guarantee (committed sites keep their
+# stored credential) holds structurally over writes/invocation.
+ADMIN_PW_SET=0
+if [ -n "${OMD_ADMIN_PASSWORD:-}" ]; then
+    ADMIN_PW_SET=1
+fi
+
 # ---- bounded children (D3 layer i, N2) --------------------------------------
 # rem_budget: the REMAINING overall bootstrap budget (120 s - elapsed).
 rem_budget() {
@@ -369,6 +381,20 @@ create_site() {
 
     # (T026) customization - the site IS being created (D4 scope)
     site_customize
+
+    # (web-admin-credential) the site web credential from the run environment.
+    # Placed at the tail of creation - AFTER customization, BEFORE the init-complete
+    # commit - so a failure here is a pre-init fatal that leaves INPROG present (the
+    # next boot re-enters creation) and never commits a site with an unknown
+    # credential. The value is passed VERBATIM as a single argv element (never through
+    # a shell string); the site's OWN version link is used (not /omd/versions/default -
+    # a site pinned to another OMD version uses its own credential tool).
+    # NO-TRIM / NO-DISCLOSE: the notice line below NEVER prints the value (it is an
+    # env var visible via podman inspect; the log must not repeat it).
+    if [ "$ADMIN_PW_SET" = 1 ]; then
+        run_bounded 30 "set omdadmin web password" runuser -u "${SITE_NAME}" -- "${SITE_DIR}/version/bin/set_admin_password" "${OMD_ADMIN_PASSWORD}"
+        echo "omd-labs-entry: web admin password set from OMD_ADMIN_PASSWORD (omdadmin)"
+    fi
 
     # the single init-complete commit point (after create + customization):
     # complete marker, then remove the in-progress marker
@@ -716,6 +742,16 @@ recover_interrupted() {
     fi
     # the site IS being (re)created - apply the effective customization (D4)
     site_customize
+    # (web-admin-credential) the site web credential from the run environment.
+    # Same placement/semantics as the created-fresh tail: after customization,
+    # before the init-complete commit. Covers BOTH recovery sub-branches above -
+    # the `omd create --reuse` branch AND the version-link `omd enable` branch
+    # (the "not yet committed/served" invariant: the pre-existing generated
+    # credential from the aborted boot was never served and is invalidated).
+    if [ "$ADMIN_PW_SET" = 1 ]; then
+        run_bounded 30 "set omdadmin web password" runuser -u "${SITE_NAME}" -- "${SITE_DIR}/version/bin/set_admin_password" "${OMD_ADMIN_PASSWORD}"
+        echo "omd-labs-entry: web admin password set from OMD_ADMIN_PASSWORD (omdadmin)"
+    fi
     # the single completion-marker commit (AFTER customization - the ordering
     # invariant: an injected failure between reconciliation and the commit
     # leaves the in-progress marker present, so the next boot re-enters recovery)

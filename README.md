@@ -110,6 +110,29 @@ site-related external input.
 The UI is served through the edge at **`https://<host>:<https-port>/<site>/`**
 (302 login redirect on first access).
 
+### Runtime web credential (`OMD_ADMIN_PASSWORD`)
+
+`OMD_ADMIN_PASSWORD` is a **runtime** environment variable that sets the
+`omdadmin` web password during site creation:
+
+- **Scope** — fresh creation or interrupted-creation recovery only.
+  **Committed sites keep their stored credential** (persisted, including
+  persisted-with-stale-marker, and adopted legacy are all committed): the
+  variable is ignored for them, so container replacement can never silently
+  rotate a credential. Rotation of a committed site stays the explicit
+  `su - <site>` + `set_admin_password` action (see [Tutorial, section 2](TUTORIAL.md#2-start-a-persistent-monitoring-site)).
+- **Semantics** — an exactly-empty value is a no-op (the generated random
+  password stands); every non-empty value is applied **verbatim** as a
+  single argument (no trimming, no shell evaluation). On success the
+  container log prints a deterministic notice that does **not** print the
+  value. A failure (tool rejection or timeout) is a pre-init fatal error:
+  nothing is started, the site is not committed, and the next start with a
+  valid value completes the creation.
+
+> **Security note:** environment variables are visible via `podman inspect`
+> and host process listings. This variable is a lab convenience, not a
+> secret-management mechanism.
+
 ## Base services
 
 With or without a site, the image always runs the OMD edge web server and

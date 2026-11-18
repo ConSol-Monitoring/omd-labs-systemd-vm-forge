@@ -10904,3 +10904,1262 @@ B0
 
 - PASS: SC-002: both volumes populated independently (root probe)
 - site-start reference ready-time: see readiness evidence above (formal median-of-5 = T034)
+## S12-s12-rocky
+- when: 2026-11-17 23:45:53
+- runtime: podman
+
+## S12-s12-rocky
+- when: 2026-11-17 23:46:54
+- runtime: podman
+
+## S12-s12-rocky
+- when: 2026-11-17 23:48:03
+- runtime: podman
+
+## S12-s12-rocky
+- when: 2026-11-17 23:54:41
+- runtime: podman
+
+- **RESULT: FAIL**
+
+- port 18450; site s12; volume /tmp/omd-verify/s12-site
+- --- (a) fresh + pw
+- PASS: (a) readiness (gate active + /s12/ answers 302/200)
+```
+ready-time=6s
+```
+
+- PASS: (a) htpasswd at EXACTLY etc/htpasswd, owned by the allocated site user (non-root) in the omd group (root probe)
+- PASS: (a) omdadmin entry present (root probe)
+- PASS: (a) thruk: authenticated 200 / anonymous 302
+```
+with-cred=200 anon=302
+```
+
+- PASS: (a) wrong password rejected (anon-equivalent 302, NOT 200)
+```
+wrong=302
+```
+
+- FAIL: (a) notice line present exactly once (deterministic, no value) (rc=1)
+```
+grep: admin: No such file or directory
+grep: password: No such file or directory
+grep: set: No such file or directory
+grep: from: No such file or directory
+grep: OMD_ADMIN_PASSWORD: No such file or directory
+```
+
+- FAIL: (a) the literal password ABSENT from the container log (rc=1)
+```
+grep: 9: No such file or directory
+```
+
+- (a) stopped before (b) (code=130, stop rc=0)
+- --- (b) verbatim
+- PASS: (b) readiness
+```
+ready-time=7s
+```
+
+- PASS: (b) login with the EXACT verbatim value succeeds (leading/trailing space + metacharacters)
+```
+exact=200
+```
+
+- PASS: (b) the TRIMMED variant FAILS (302 - proves no trimming / no shell-evaluated string)
+```
+trimmed=302
+```
+
+- FAIL: (b) notice present; the verbatim value ABSENT from the log (rc=1)
+```
+grep: admin: No such file or directory
+grep: password: No such file or directory
+grep: set: No such file or directory
+grep: from: No such file or directory
+grep: OMD_ADMIN_PASSWORD: No such file or directory
+```
+
+- --- (c) replacement, stored wins (fresh container on the (a) volume)
+- PASS: (c) readiness (resume, gate active + /s12/)
+```
+ready-time=3s
+```
+
+- FAIL: (c) log shows 'resumed existing site s12' (row 2, no re-creation) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- FAIL: (c) NO notice (the variable is a creation-only input, ignored on resume) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- PASS: (c) the STORED credential logs in (the (a) value, extracted before the run)
+```
+stored=200
+```
+
+- PASS: (c) the NEW value is REJECTED (stored wins, 302)
+```
+new=302
+```
+
+- PASS: (c) htpasswd content UNCHANGED (sha256 before == after, root probe)
+- (c) stored omdadmin hash: omdadmin:$apr1$mVLtNoUM$T4M8nSsZE8iXA.Uu...
+- --- (e) clean stop contract
+- PASS: (e) clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- --- (d) empty value = no-op
+- PASS: (d) readiness
+```
+ready-time=6s
+```
+
+- FAIL: (d) NO notice (the exactly-empty value is a no-op, no setter invocation) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- PASS: (d) the generated omdadmin entry stands in etc/htpasswd (root probe)
+- FAIL: (d) 'created new site s12' (fresh creation, no credential step) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- --- (i) recovery, tree-only (create --reuse branch)
+- PASS: (i) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=6s
+```
+
+- PASS: (i) recovery banner present
+```
+2026-11-17T22:55:28+00:00 85df7a2baa80 omd-ready-check[1302]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-17T22:55:28+00:00 85df7a2baa80 systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-17T22:55:28+00:00 85df7a2baa80 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-17T22:55:28+00:00 85df7a2baa80 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-17T22:55:28+00:00 85df7a2baa80 systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-17T22:55:28+00:00 85df7a2baa80 systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-17T22:55:28+00:00 85df7a2baa80 systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-17T22:55:28+00:00 85df7a2baa80 systemd[1]: Startup finished in 2.464s.
+```
+
+- PASS: (i) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- FAIL: (i) notice present (the creation tail was re-run) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- PASS: (i) committed: complete marker present, in-progress gone (root probe)
+- --- (ii) recovery, version-link (omd enable branch, old credential invalidated)
+- PASS: (ii) readiness
+```
+ready-time=4s
+```
+
+- PASS: (ii) recovery banner + the version-link re-registration line
+```
+2026-11-17T22:55:39+00:00 a4eb63cff536 omd-ready-check[510]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-17T22:55:39+00:00 a4eb63cff536 systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-17T22:55:39+00:00 a4eb63cff536 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-17T22:55:39+00:00 a4eb63cff536 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-17T22:55:39+00:00 a4eb63cff536 systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-17T22:55:39+00:00 a4eb63cff536 systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-17T22:55:39+00:00 a4eb63cff536 systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-17T22:55:39+00:00 a4eb63cff536 systemd[1]: Startup finished in 2.609s.
+```
+
+- PASS: (ii) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- FAIL: (ii) the PRE-EXISTING generated credential is INVALIDATED (htpasswd entry replaced; anon stays 302) (rc=1)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: line 414: apr1: unbound variable
+```
+
+- FAIL: (ii) notice present (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- --- (iii) persisted (stale INPROG), stored wins
+- PASS: (iii) readiness (resume, not recovery)
+```
+ready-time=3s
+```
+
+- FAIL: (iii) log shows 'resumed existing site s12' (persisted row, not re-creation) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- PASS: (iii) stale in-progress marker REMOVED (root probe)
+- FAIL: (iii) NO notice (no creation tail ran) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- PASS: (iii) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iii) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iii) htpasswd UNCHANGED (sha256, root probe)
+- --- (iv) adopted legacy, stored wins
+- PASS: (iv) readiness (adopt path starts the site)
+```
+ready-time=3s
+```
+
+- PASS: (iv) prominent 'adopted existing site' banner
+```
+2026-11-17T22:55:59+00:00 7098ceae1518 omd-ready-check[508]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-17T22:55:59+00:00 7098ceae1518 systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-17T22:55:59+00:00 7098ceae1518 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-17T22:55:59+00:00 7098ceae1518 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-17T22:55:59+00:00 7098ceae1518 systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-17T22:55:59+00:00 7098ceae1518 systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-17T22:55:59+00:00 7098ceae1518 systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-17T22:55:59+00:00 7098ceae1518 systemd[1]: Startup finished in 2.750s.
+```
+
+- FAIL: (iv) NO notice (the credential step is absent from adopt_site) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- PASS: (iv) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iv) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iv) htpasswd UNCHANGED (sha256, root probe)
+- --- (j) fresh tail: injected failure at the credential step
+- PASS: (j) failure at the fresh credential step ? exit 1 (code=1)
+- PASS: (j) the injected line was REACHED (sentinel present, cp from stopped container)
+- FAIL: (j) the credential step had SUCCEEDED before the injection (notice present, value NOT in it) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- FAIL: (j) the password value ABSENT from entry-fatal AND the container log (rc=1)
+```
+grep: 9: No such file or directory
+```
+
+- PASS: (j) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (j) INPROG marker RETAINED (retry re-enters the creation lifecycle, root probe)
+- (j) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- PASS: (j) retry completes: ready (gate + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (j) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (j) retry committed: complete marker + in-progress gone (root probe)
+- --- (k) recovery tail: injected failure at the credential step
+- PASS: (k) failure at the recovery credential step ? exit 1 (code=1)
+- PASS: (k) the injected line was REACHED (sentinel present, cp from stopped container)
+- FAIL: (k) the credential step had SUCCEEDED before the injection (notice present, value NOT in it) (rc=2)
+```
+/home/lausser/git/omd-labs-systemd-vm-forge/verify/common.sh: eval: line 414: unexpected EOF while looking for matching `"'
+```
+
+- FAIL: (k) the password value ABSENT from entry-fatal AND the container log (rc=1)
+```
+grep: 9: No such file or directory
+```
+
+- PASS: (k) COMPLETE marker ABSENT (the recovery never committed, root probe)
+- PASS: (k) INPROG marker RETAINED (root probe)
+- (k) no site service could be up: the entry fatals PRE-init - the named cause IS the proof nothing was started
+- PASS: (k) retry completes: ready (gate + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (k) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (k) retry committed: complete marker + in-progress gone (root probe)
+- sub-items (a)-(e), (i)-(iv), (j), (k) done
+## repro
+- when: 2026-11-18 00:21:42
+- runtime: podman
+
+- **RESULT: FAIL**
+
+- FAIL: (d) NO notice (the exactly-empty value is a no-op, no setter invocation) (rc=2)
+```
+./common.sh: eval: line 415: unexpected EOF while looking for matching `)'
+```
+
+## repro3
+- when: 2026-11-18 00:24:03
+- runtime: podman
+
+- **RESULT: FAIL**
+
+- FAIL: s1-32-form: no OMD site exists (rc=1)
+```
+Error: no container with name or ID "omd-s12d" found: no such container
+```
+
+- FAIL: my-(d)-form (rc=2)
+```
+./common.sh: eval: line 415: unexpected EOF while looking for matching `)'
+```
+
+## S12-s12-rocky
+- when: 2026-11-18 02:16:42
+- runtime: podman
+
+## S12-s12-rocky
+- when: 2026-11-18 02:30:17
+- runtime: podman
+
+## S12-s12-rocky
+- when: 2026-11-18 02:34:00
+- runtime: podman
+
+- **RESULT: FAIL**
+
+- port 18450; site s12; volume /tmp/omd-verify/s12-site
+- --- (a) fresh + pw
+- PASS: (a) readiness (gate active + /s12/ answers 302/200)
+```
+ready-time=6s
+```
+
+- PASS: (a) htpasswd at EXACTLY etc/htpasswd, owned by the allocated site user (non-root, root probe)
+- PASS: (a) omdadmin entry present (root probe)
+- PASS: (a) thruk: authenticated 200 / anonymous 302
+```
+with-cred=200 anon=302
+```
+
+- PASS: (a) wrong password rejected (anon-equivalent 302, NOT 200)
+```
+wrong=302
+```
+
+- PASS: (a) notice line present exactly once (deterministic, no value)
+- PASS: (a) the literal password ABSENT from the container log (hardened: read must succeed and capture the entry's own output)
+- (a) stopped before (b) (code=130, stop rc=0)
+- --- (b) verbatim
+- PASS: (b) readiness
+```
+ready-time=6s
+```
+
+- PASS: (b) login with the EXACT verbatim value succeeds (leading/trailing space + metacharacters)
+```
+exact=200
+```
+
+- PASS: (b) the TRIMMED variant FAILS (302 - proves no trimming / no shell-evaluated string)
+```
+trimmed=302
+```
+
+- PASS: (b) notice present; the verbatim value ABSENT from the log
+- --- (c) replacement, stored wins (fresh container on the (a) volume)
+- PASS: (c) readiness (resume, gate active + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (c) log shows 'resumed existing site s12' (row 2, no re-creation)
+- PASS: (c) NO notice (the variable is a creation-only input, ignored on resume; hardened read)
+- PASS: (c) the STORED credential logs in (the (a) value, extracted before the run)
+```
+stored=200
+```
+
+- PASS: (c) the NEW value is REJECTED (stored wins, 302)
+```
+new=302
+```
+
+- PASS: (c) htpasswd content UNCHANGED (sha256 before == after, root probe)
+- (c) stored omdadmin hash: omdadmin:$apr1$h1.V2v3u$6AS7YRAmEk48flYZ...
+- --- (e) clean stop contract
+- PASS: (e) clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- --- (d) empty value = no-op
+- PASS: (d) readiness
+```
+ready-time=6s
+```
+
+- PASS: (d) NO notice (the exactly-empty value is a no-op, no setter invocation; hardened read)
+- PASS: (d) the credential step was NEVER INVOKED (the run_bounded step line is absent; hardened read)
+- PASS: (d) the generated omdadmin entry stands in etc/htpasswd (root probe)
+- PASS: (d) 'created new site s12' (fresh creation, no credential step)
+- --- (i) recovery, tree-only (create --reuse branch)
+- PASS: (i) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=5s
+```
+
+- PASS: (i) recovery banner present
+```
+2026-11-18T01:34:48+00:00 9e3f0ba0ece9 omd-ready-check[1304]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-18T01:34:48+00:00 9e3f0ba0ece9 systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-18T01:34:48+00:00 9e3f0ba0ece9 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-18T01:34:48+00:00 9e3f0ba0ece9 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-18T01:34:48+00:00 9e3f0ba0ece9 systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-18T01:34:48+00:00 9e3f0ba0ece9 systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-18T01:34:48+00:00 9e3f0ba0ece9 systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-18T01:34:48+00:00 9e3f0ba0ece9 systemd[1]: Startup finished in 2.598s.
+```
+
+- PASS: (i) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- PASS: (i) notice present (the creation tail was re-run)
+- PASS: (i) committed: complete marker present, in-progress gone (root probe)
+- --- (ii) recovery, version-link (omd enable branch, old credential invalidated)
+- PASS: (ii) pre-state: the KNOWN old credential is seeded (root probe)
+- PASS: (ii) readiness
+```
+ready-time=3s
+```
+
+- PASS: (ii) recovery banner + the version-link re-registration line
+```
+2026-11-18T01:35:00+00:00 e0034e32538d omd-ready-check[332]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-18T01:35:00+00:00 e0034e32538d systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-18T01:35:00+00:00 e0034e32538d systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-18T01:35:00+00:00 e0034e32538d systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-18T01:35:00+00:00 e0034e32538d systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-18T01:35:00+00:00 e0034e32538d systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-18T01:35:00+00:00 e0034e32538d systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-18T01:35:00+00:00 e0034e32538d systemd[1]: Startup finished in 2.698s.
+```
+
+- PASS: (ii) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- PASS: (ii) the SEEDING credential is now REJECTED: the pre-existing generated credential is INVALIDATED (old-pw login 302; the env value logs in - primary oracle)
+```
+old-pw=302
+```
+
+- PASS: (ii) the htpasswd entry was REPLACED (new non-empty, different from the SEEDING entry, root probe)
+- PASS: (ii) anonymous access stays 302 (no anonymous bypass introduced)
+```
+anon=302
+```
+
+- PASS: (ii) notice present
+- --- (iii) persisted (stale INPROG), stored wins
+- PASS: (iii) readiness (resume, not recovery)
+```
+ready-time=3s
+```
+
+- PASS: (iii) log shows 'resumed existing site s12' (persisted row, not re-creation)
+- PASS: (iii) stale in-progress marker REMOVED (root probe)
+- PASS: (iii) NO notice (no creation tail ran; hardened read)
+- PASS: (iii) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iii) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iii) htpasswd UNCHANGED (sha256, root probe)
+- --- (iv) adopted legacy, stored wins
+- PASS: (iv) readiness (adopt path starts the site)
+```
+ready-time=3s
+```
+
+- PASS: (iv) prominent 'adopted existing site' banner
+```
+2026-11-18T01:35:24+00:00 d0896db42fc7 omd-ready-check[507]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-18T01:35:24+00:00 d0896db42fc7 systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-18T01:35:24+00:00 d0896db42fc7 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-18T01:35:24+00:00 d0896db42fc7 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-18T01:35:24+00:00 d0896db42fc7 systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-18T01:35:24+00:00 d0896db42fc7 systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-18T01:35:24+00:00 d0896db42fc7 systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-18T01:35:24+00:00 d0896db42fc7 systemd[1]: Startup finished in 2.497s.
+```
+
+- PASS: (iv) NO notice (the credential step is absent from adopt_site; hardened read)
+- PASS: (iv) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iv) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iv) htpasswd UNCHANGED (sha256, root probe)
+- --- (j) fresh tail: injected failure at the credential step
+- PASS: (j) failure at the fresh credential step ? exit 1 (code=1)
+- PASS: (j) the injected line was REACHED (sentinel present, cp from stopped container)
+- PASS: (j) the credential step had SUCCEEDED before the injection (notice present, value NOT in it)
+- PASS: (j) the password value ABSENT from entry-fatal AND the container log (hardened: fresh copy, cp+read must succeed)
+- PASS: (j) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (j) INPROG marker RETAINED (retry re-enters the creation lifecycle, root probe)
+- (j) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- PASS: (j) retry completes: ready (gate + /s12/)
+```
+ready-time=4s
+```
+
+- PASS: (j) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (j) retry committed: complete marker + in-progress gone (root probe)
+- --- (k) recovery tail: injected failure at the credential step
+- PASS: (k) failure at the recovery credential step ? exit 1 (code=1)
+- PASS: (k) the injected line was REACHED (sentinel present, cp from stopped container)
+- PASS: (k) the credential step had SUCCEEDED before the injection (notice present, value NOT in it)
+- PASS: (k) the password value ABSENT from entry-fatal AND the container log (hardened: fresh copy, cp+read must succeed)
+- PASS: (k) COMPLETE marker ABSENT (the recovery never committed, root probe)
+- PASS: (k) INPROG marker RETAINED (root probe)
+- (k) no site service could be up: the entry fatals PRE-init - the named cause IS the proof nothing was started
+- PASS: (k) retry completes: ready (gate + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (k) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (k) retry committed: complete marker + in-progress gone (root probe)
+- --- (l) fresh tail: the REAL tool fails (rc=99) - production run_bounded/fatal
+- PASS: (l) the real tool failure -> exit 1 (code=1)
+- PASS: (l) the credential step WAS invoked (the real run_bounded step line present, hardened read)
+- PASS: (l) the success notice is ABSENT (the setter did not succeed; hardened read)
+- PASS: (l) the value is ABSENT from entry-fatal AND the container log (non-disclosure on the real failure path; fresh copy, cp+read must succeed)
+- FAIL: (l) run_bounded REPLAYED the real child output (the tool's fault line is in the log) (rc=1)
+```
+
+```
+
+- PASS: (l) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (l) INPROG marker RETAINED (the next boot re-enters the lifecycle, root probe)
+- (l) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- --- (m) fresh tail: the REAL tool TIMES OUT (45s > the 30s bound)
+- PASS: (m) the real tool timeout -> exit 1 (code=1)
+- FAIL: (m) the run_bounded TIMEOUT branch fired: 'step timed out' line present in the container log (stderr channel; hardened read) (rc=1)
+```
+
+```
+
+- PASS: (m) entry-fatal carries the TIMEOUT rc (124 or 137) for the named step (fresh copy, cp+read must succeed)
+- PASS: (m) the credential step WAS invoked (the real run_bounded step line present, hardened read)
+- PASS: (m) the value is ABSENT from entry-fatal AND the container log (fresh copy, cp+read must succeed)
+- PASS: (m) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (m) INPROG marker RETAINED (root probe)
+- --- (n) retry after the real (l) failure: the normal image completes the creation
+- PASS: (n) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (n) the value is now the effective credential (login 200)
+```
+with-cred=200
+```
+
+- PASS: (n) notice present exactly once (the creation tail ran, hardened read)
+- PASS: (n) committed: complete marker present, in-progress gone (root probe)
+- sub-items (a)-(e), (i)-(iv), (j), (k), (l), (m), (n) done
+## S12-s12-rocky
+- when: 2026-11-18 02:39:25
+- runtime: podman
+
+## S12-s12-rocky
+- when: 2026-11-18 02:40:53
+- runtime: podman
+
+- **RESULT: FAIL**
+
+- port 18450; site s12; volume /tmp/omd-verify/s12-site
+- --- (a) fresh + pw
+- PASS: (a) readiness (gate active + /s12/ answers 302/200)
+```
+ready-time=6s
+```
+
+- PASS: (a) htpasswd at EXACTLY etc/htpasswd, owned by the allocated site user (non-root, root probe)
+- PASS: (a) omdadmin entry present (root probe)
+- PASS: (a) thruk: authenticated 200 / anonymous 302
+```
+with-cred=200 anon=302
+```
+
+- PASS: (a) wrong password rejected (anon-equivalent 302, NOT 200)
+```
+wrong=302
+```
+
+- PASS: (a) notice line present exactly once (deterministic, no value)
+- PASS: (a) the literal password ABSENT from the container log (hardened: read must succeed and capture the entry's own output)
+- (a) stopped before (b) (code=130, stop rc=0)
+- --- (b) verbatim
+- PASS: (b) readiness
+```
+ready-time=6s
+```
+
+- PASS: (b) login with the EXACT verbatim value succeeds (leading/trailing space + metacharacters)
+```
+exact=200
+```
+
+- PASS: (b) the TRIMMED variant FAILS (302 - proves no trimming / no shell-evaluated string)
+```
+trimmed=302
+```
+
+- PASS: (b) notice present; the verbatim value ABSENT from the log
+- --- (c) replacement, stored wins (fresh container on the (a) volume)
+- PASS: (c) readiness (resume, gate active + /s12/)
+```
+ready-time=4s
+```
+
+- PASS: (c) log shows 'resumed existing site s12' (row 2, no re-creation)
+- PASS: (c) NO notice (the variable is a creation-only input, ignored on resume; hardened read)
+- PASS: (c) the STORED credential logs in (the (a) value, extracted before the run)
+```
+stored=200
+```
+
+- PASS: (c) the NEW value is REJECTED (stored wins, 302)
+```
+new=302
+```
+
+- PASS: (c) htpasswd content UNCHANGED (sha256 before == after, root probe)
+- (c) stored omdadmin hash: omdadmin:$apr1$f2ulx1KL$K.eyzXlgecyFCx5j...
+- --- (e) clean stop contract
+- PASS: (e) clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- --- (d) empty value = no-op
+- PASS: (d) readiness
+```
+ready-time=6s
+```
+
+- PASS: (d) NO notice (the exactly-empty value is a no-op, no setter invocation; hardened read)
+- PASS: (d) the credential step was NEVER INVOKED (the run_bounded step line is absent; hardened read)
+- PASS: (d) the generated omdadmin entry stands in etc/htpasswd (root probe)
+- PASS: (d) 'created new site s12' (fresh creation, no credential step)
+- --- (i) recovery, tree-only (create --reuse branch)
+- PASS: (i) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=6s
+```
+
+- PASS: (i) recovery banner present
+```
+2026-11-18T01:41:41+00:00 fb6d85225f9f omd-ready-check[1302]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-18T01:41:41+00:00 fb6d85225f9f systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-18T01:41:41+00:00 fb6d85225f9f systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-18T01:41:41+00:00 fb6d85225f9f systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-18T01:41:41+00:00 fb6d85225f9f systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-18T01:41:41+00:00 fb6d85225f9f systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-18T01:41:41+00:00 fb6d85225f9f systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-18T01:41:41+00:00 fb6d85225f9f systemd[1]: Startup finished in 2.545s.
+```
+
+- PASS: (i) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- PASS: (i) notice present (the creation tail was re-run)
+- PASS: (i) committed: complete marker present, in-progress gone (root probe)
+- --- (ii) recovery, version-link (omd enable branch, old credential invalidated)
+- PASS: (ii) pre-state: the KNOWN old credential is seeded (root probe)
+- PASS: (ii) readiness
+```
+ready-time=3s
+```
+
+- PASS: (ii) recovery banner + the version-link re-registration line
+```
+2026-11-18T01:41:53+00:00 c28e2ca8a5f5 omd-ready-check[506]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-18T01:41:53+00:00 c28e2ca8a5f5 systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-18T01:41:53+00:00 c28e2ca8a5f5 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-18T01:41:53+00:00 c28e2ca8a5f5 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-18T01:41:53+00:00 c28e2ca8a5f5 systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-18T01:41:53+00:00 c28e2ca8a5f5 systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-18T01:41:53+00:00 c28e2ca8a5f5 systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-18T01:41:53+00:00 c28e2ca8a5f5 systemd[1]: Startup finished in 2.450s.
+```
+
+- PASS: (ii) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- PASS: (ii) the SEEDING credential is now REJECTED: the pre-existing generated credential is INVALIDATED (old-pw login 302; the env value logs in - primary oracle)
+```
+old-pw=302
+```
+
+- PASS: (ii) the htpasswd entry was REPLACED (new non-empty, different from the SEEDING entry, root probe)
+- PASS: (ii) anonymous access stays 302 (no anonymous bypass introduced)
+```
+anon=302
+```
+
+- PASS: (ii) notice present
+- --- (iii) persisted (stale INPROG), stored wins
+- PASS: (iii) readiness (resume, not recovery)
+```
+ready-time=4s
+```
+
+- PASS: (iii) log shows 'resumed existing site s12' (persisted row, not re-creation)
+- PASS: (iii) stale in-progress marker REMOVED (root probe)
+- PASS: (iii) NO notice (no creation tail ran; hardened read)
+- PASS: (iii) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iii) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iii) htpasswd UNCHANGED (sha256, root probe)
+- --- (iv) adopted legacy, stored wins
+- PASS: (iv) readiness (adopt path starts the site)
+```
+ready-time=3s
+```
+
+- PASS: (iv) prominent 'adopted existing site' banner
+```
+2026-11-18T01:42:15+00:00 8cb96d60e573 omd-ready-check[508]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-18T01:42:15+00:00 8cb96d60e573 systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-18T01:42:15+00:00 8cb96d60e573 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-18T01:42:15+00:00 8cb96d60e573 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-18T01:42:15+00:00 8cb96d60e573 systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-18T01:42:15+00:00 8cb96d60e573 systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-18T01:42:15+00:00 8cb96d60e573 systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-18T01:42:15+00:00 8cb96d60e573 systemd[1]: Startup finished in 2.590s.
+```
+
+- PASS: (iv) NO notice (the credential step is absent from adopt_site; hardened read)
+- PASS: (iv) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iv) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iv) htpasswd UNCHANGED (sha256, root probe)
+- --- (j) fresh tail: injected failure at the credential step
+- PASS: (j) failure at the fresh credential step ? exit 1 (code=1)
+- PASS: (j) the injected line was REACHED (sentinel present, cp from stopped container)
+- PASS: (j) the credential step had SUCCEEDED before the injection (notice present, value NOT in it)
+- PASS: (j) the password value ABSENT from entry-fatal AND the container log (hardened: fresh copy, cp+read must succeed)
+- PASS: (j) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (j) INPROG marker RETAINED (retry re-enters the creation lifecycle, root probe)
+- (j) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- PASS: (j) retry completes: ready (gate + /s12/)
+```
+ready-time=4s
+```
+
+- PASS: (j) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (j) retry committed: complete marker + in-progress gone (root probe)
+- --- (k) recovery tail: injected failure at the credential step
+- PASS: (k) failure at the recovery credential step ? exit 1 (code=1)
+- PASS: (k) the injected line was REACHED (sentinel present, cp from stopped container)
+- PASS: (k) the credential step had SUCCEEDED before the injection (notice present, value NOT in it)
+- PASS: (k) the password value ABSENT from entry-fatal AND the container log (hardened: fresh copy, cp+read must succeed)
+- PASS: (k) COMPLETE marker ABSENT (the recovery never committed, root probe)
+- PASS: (k) INPROG marker RETAINED (root probe)
+- (k) no site service could be up: the entry fatals PRE-init - the named cause IS the proof nothing was started
+- PASS: (k) retry completes: ready (gate + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (k) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (k) retry committed: complete marker + in-progress gone (root probe)
+- --- (l) fresh tail: the REAL tool fails (rc=99) - production run_bounded/fatal
+- PASS: (l) the real tool failure -> exit 1 (code=1)
+- PASS: (l) the credential step WAS invoked (the real run_bounded step line present, hardened read)
+- PASS: (l) the success notice is ABSENT (the setter did not succeed; hardened read)
+- PASS: (l) the value is ABSENT from entry-fatal AND the container log (non-disclosure on the real failure path; fresh copy, cp+read must succeed)
+- FAIL: (l) run_bounded REPLAYED the real child output (the tool's fault line is in the log, polled) (rc=1)
+```
+v_wait_log: pattern not visible within 30s: s12-tool-fault
+--- last log lines:
+omd-labs-entry: creating site s12 (row 1)
+omd-labs-entry: step: omd create --reuse s12 (bounded: 90s)
+omd-labs-entry: no customization inputs - skipping
+omd-labs-entry: step: set omdadmin web password (bounded: 30s)
+omd-labs-entry: rolling back bootstrap-created artifacts (no pre-existing data touched)
+```
+
+- PASS: (l) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (l) INPROG marker RETAINED (the next boot re-enters the lifecycle, root probe)
+- (l) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- --- (m) fresh tail: the REAL tool TIMES OUT (45s > the 30s bound)
+- PASS: (m) the real tool timeout -> exit 1 (code=1)
+- FAIL: (m) the run_bounded TIMEOUT branch fired: 'step timed out' line present in the container log (stderr channel, polled) (rc=1)
+```
+v_wait_log: pattern not visible within 30s: FATAL: step timed out after 30s: set omdadmin web password
+--- last log lines:
+omd-labs-entry: creating site s12 (row 1)
+omd-labs-entry: step: omd create --reuse s12 (bounded: 90s)
+omd-labs-entry: no customization inputs - skipping
+omd-labs-entry: step: set omdadmin web password (bounded: 30s)
+omd-labs-entry: rolling back bootstrap-created artifacts (no pre-existing data touched)
+```
+
+- PASS: (m) entry-fatal carries the TIMEOUT rc (124 or 137) for the named step (fresh copy, cp+read must succeed)
+- PASS: (m) the credential step WAS invoked (the real run_bounded step line present, hardened read)
+- PASS: (m) the value is ABSENT from entry-fatal AND the container log (fresh copy, cp+read must succeed)
+- PASS: (m) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (m) INPROG marker RETAINED (root probe)
+- --- (n) retry after the real (l) failure: the normal image completes the creation
+- PASS: (n) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (n) the value is now the effective credential (login 200)
+```
+with-cred=200
+```
+
+- PASS: (n) notice present exactly once (the creation tail ran, hardened read)
+- PASS: (n) committed: complete marker present, in-progress gone (root probe)
+- sub-items (a)-(e), (i)-(iv), (j), (k), (l), (m), (n) done
+## S12-s12-rocky
+- when: 2026-11-18 02:55:46
+- runtime: podman
+
+- **RESULT: PASS**
+
+- port 18450; site s12; volume /tmp/omd-verify/s12-site
+- --- (a) fresh + pw
+- PASS: (a) readiness (gate active + /s12/ answers 302/200)
+```
+ready-time=6s
+```
+
+- PASS: (a) htpasswd at EXACTLY etc/htpasswd, owned by the allocated site user (non-root, root probe)
+- PASS: (a) omdadmin entry present (root probe)
+- PASS: (a) thruk: authenticated 200 / anonymous 302
+```
+with-cred=200 anon=302
+```
+
+- PASS: (a) wrong password rejected (anon-equivalent 302, NOT 200)
+```
+wrong=302
+```
+
+- PASS: (a) notice line present exactly once (deterministic, no value)
+- PASS: (a) the literal password ABSENT from the container log (hardened: read must succeed and capture the entry's own output)
+- (a) stopped before (b) (code=130, stop rc=0)
+- --- (b) verbatim
+- PASS: (b) readiness
+```
+ready-time=6s
+```
+
+- PASS: (b) login with the EXACT verbatim value succeeds (leading/trailing space + metacharacters)
+```
+exact=200
+```
+
+- PASS: (b) the TRIMMED variant FAILS (302 - proves no trimming / no shell-evaluated string)
+```
+trimmed=302
+```
+
+- PASS: (b) notice present; the verbatim value ABSENT from the log
+- --- (c) replacement, stored wins (fresh container on the (a) volume)
+- PASS: (c) readiness (resume, gate active + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (c) log shows 'resumed existing site s12' (row 2, no re-creation)
+- PASS: (c) NO notice (the variable is a creation-only input, ignored on resume; hardened read)
+- PASS: (c) the STORED credential logs in (the (a) value, extracted before the run)
+```
+stored=200
+```
+
+- PASS: (c) the NEW value is REJECTED (stored wins, 302)
+```
+new=302
+```
+
+- PASS: (c) htpasswd content UNCHANGED (sha256 before == after, root probe)
+- (c) stored omdadmin hash: omdadmin:$apr1$sQe/z/Cc$NtG7SjKYDx6S1K/1...
+- --- (e) clean stop contract
+- PASS: (e) clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- --- (d) empty value = no-op
+- PASS: (d) readiness
+```
+ready-time=7s
+```
+
+- PASS: (d) NO notice (the exactly-empty value is a no-op, no setter invocation; hardened read)
+- PASS: (d) the credential step was NEVER INVOKED (the run_bounded step line is absent; hardened read)
+- PASS: (d) the generated omdadmin entry stands in etc/htpasswd (root probe)
+- PASS: (d) 'created new site s12' (fresh creation, no credential step)
+- --- (i) recovery, tree-only (create --reuse branch)
+- PASS: (i) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=6s
+```
+
+- PASS: (i) recovery banner present
+```
+2026-11-18T01:56:34+00:00 761e2dbc651e systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-18T01:56:34+00:00 761e2dbc651e systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-18T01:56:34+00:00 761e2dbc651e systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-18T01:56:34+00:00 761e2dbc651e systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-18T01:56:34+00:00 761e2dbc651e systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-18T01:56:34+00:00 761e2dbc651e systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-18T01:56:34+00:00 761e2dbc651e systemd[1]: Started systemd-timedated.service - Time & Date Service.
+2026-11-18T01:56:34+00:00 761e2dbc651e systemd[1]: Startup finished in 2.757s.
+```
+
+- PASS: (i) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- PASS: (i) notice present (the creation tail was re-run)
+- PASS: (i) committed: complete marker present, in-progress gone (root probe)
+- --- (ii) recovery, version-link (omd enable branch, old credential invalidated)
+- PASS: (ii) pre-state: the KNOWN old credential is seeded (root probe)
+- PASS: (ii) readiness
+```
+ready-time=3s
+```
+
+- PASS: (ii) recovery banner + the version-link re-registration line
+```
+2026-11-18T01:56:44+00:00 9ca2d0ce1d58 omd-site-start[308]: Starting crontab...OK
+2026-11-18T01:56:44+00:00 9ca2d0ce1d58 omd-site-start[102]: OK
+2026-11-18T01:56:44+00:00 9ca2d0ce1d58 systemd[1]: Finished omd-site.service - OMD labs single active site (start/stop).
+2026-11-18T01:56:44+00:00 9ca2d0ce1d58 systemd[1]: Starting omd-ready.service - OMD labs bounded readiness gate (FR-018)...
+2026-11-18T01:56:44+00:00 9ca2d0ce1d58 sshd-session[532]: Connection closed by 127.0.0.1 port 44614
+2026-11-18T01:56:44+00:00 9ca2d0ce1d58 crontab[568]: (s12) LIST (s12)
+2026-11-18T01:56:45+00:00 9ca2d0ce1d58 systemd[1]: Starting systemd-timedated.service - Time & Date Service...
+2026-11-18T01:56:45+00:00 9ca2d0ce1d58 systemd[1]: Started systemd-timedated.service - Time & Date Service.
+```
+
+- PASS: (ii) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- PASS: (ii) the SEEDING credential is now REJECTED: the pre-existing generated credential is INVALIDATED (old-pw login 302; the env value logs in - primary oracle)
+```
+old-pw=302
+```
+
+- PASS: (ii) the htpasswd entry was REPLACED (new non-empty, different from the SEEDING entry, root probe)
+- PASS: (ii) anonymous access stays 302 (no anonymous bypass introduced)
+```
+anon=302
+```
+
+- PASS: (ii) notice present
+- --- (iii) persisted (stale INPROG), stored wins
+- PASS: (iii) readiness (resume, not recovery)
+```
+ready-time=3s
+```
+
+- PASS: (iii) log shows 'resumed existing site s12' (persisted row, not re-creation)
+- PASS: (iii) stale in-progress marker REMOVED (root probe)
+- PASS: (iii) NO notice (no creation tail ran; hardened read)
+- PASS: (iii) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iii) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iii) htpasswd UNCHANGED (sha256, root probe)
+- --- (iv) adopted legacy, stored wins
+- PASS: (iv) readiness (adopt path starts the site)
+```
+ready-time=3s
+```
+
+- PASS: (iv) prominent 'adopted existing site' banner
+```
+2026-11-18T01:57:07+00:00 7b873b9d77db omd-ready-check[506]: READY: base services up (omd-site active, httpd 443, sshd 22)
+2026-11-18T01:57:07+00:00 7b873b9d77db systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-18T01:57:07+00:00 7b873b9d77db systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-18T01:57:07+00:00 7b873b9d77db systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-18T01:57:07+00:00 7b873b9d77db systemd[1]: Starting systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP...
+2026-11-18T01:57:07+00:00 7b873b9d77db systemd[1]: systemd-update-utmp-runlevel.service: Deactivated successfully.
+2026-11-18T01:57:07+00:00 7b873b9d77db systemd[1]: Finished systemd-update-utmp-runlevel.service - Record Runlevel Change in UTMP.
+2026-11-18T01:57:07+00:00 7b873b9d77db systemd[1]: Startup finished in 2.475s.
+```
+
+- PASS: (iv) NO notice (the credential step is absent from adopt_site; hardened read)
+- PASS: (iv) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iv) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iv) htpasswd UNCHANGED (sha256, root probe)
+- --- (j) fresh tail: injected failure at the credential step
+- PASS: (j) failure at the fresh credential step ? exit 1 (code=1)
+- PASS: (j) the injected line was REACHED (sentinel present, cp from stopped container)
+- PASS: (j) the credential step had SUCCEEDED before the injection (notice present, value NOT in it)
+- PASS: (j) the password value ABSENT from entry-fatal AND the container log (hardened: fresh copy, cp+read must succeed)
+- PASS: (j) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (j) INPROG marker RETAINED (retry re-enters the creation lifecycle, root probe)
+- (j) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- PASS: (j) retry completes: ready (gate + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (j) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (j) retry committed: complete marker + in-progress gone (root probe)
+- --- (k) recovery tail: injected failure at the credential step
+- PASS: (k) failure at the recovery credential step ? exit 1 (code=1)
+- PASS: (k) the injected line was REACHED (sentinel present, cp from stopped container)
+- PASS: (k) the credential step had SUCCEEDED before the injection (notice present, value NOT in it)
+- PASS: (k) the password value ABSENT from entry-fatal AND the container log (hardened: fresh copy, cp+read must succeed)
+- PASS: (k) COMPLETE marker ABSENT (the recovery never committed, root probe)
+- PASS: (k) INPROG marker RETAINED (root probe)
+- (k) no site service could be up: the entry fatals PRE-init - the named cause IS the proof nothing was started
+- PASS: (k) retry completes: ready (gate + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (k) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (k) retry committed: complete marker + in-progress gone (root probe)
+- --- (l) fresh tail: the REAL tool fails (rc=99) - production run_bounded/fatal
+- PASS: (l) the real tool failure -> exit 1 (code=1)
+- PASS: (l) the credential step WAS invoked (the real run_bounded step line present, hardened read)
+- PASS: (l) the success notice is ABSENT (the setter did not succeed; hardened read)
+- PASS: (l) the value is ABSENT from entry-fatal AND the container log (non-disclosure on the real failure path; fresh copy, cp+read must succeed)
+- PASS: (l) the fault body EXECUTED (the volume mark the injected line wrote, root probe)
+- PASS: (l) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (l) INPROG marker RETAINED (the next boot re-enters the lifecycle, root probe)
+- (l) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- --- (m) fresh tail: the REAL tool TIMES OUT (45s > the 30s bound)
+- PASS: (m) the real tool timeout -> exit 1 (code=1)
+- PASS: (m) entry-fatal carries the TIMEOUT rc (124 or 137) for the named step (fresh copy, cp+read must succeed)
+- PASS: (m) the credential step WAS invoked (the real run_bounded step line present, hardened read)
+- PASS: (m) the value is ABSENT from entry-fatal AND the container log (fresh copy, cp+read must succeed)
+- PASS: (m) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (m) INPROG marker RETAINED (root probe)
+- --- (n) retry after the real (l) failure: the normal image completes the creation
+- PASS: (n) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (n) the value is now the effective credential (login 200)
+```
+with-cred=200
+```
+
+- PASS: (n) notice present exactly once (the creation tail ran, hardened read)
+- PASS: (n) committed: complete marker present, in-progress gone (root probe)
+- sub-items (a)-(e), (i)-(iv), (j), (k), (l), (m), (n) done
+## S2-s2-rocky
+- when: 2026-11-18 02:59:41
+- runtime: podman
+
+- **RESULT: PASS**
+
+- PASS: readiness (gate active + /mysite/ answers 302/200)
+```
+ready-time=6s
+```
+
+- PASS: log shows prominent 'created new site mysite'
+- PASS: omd status mysite running (rc 0)
+```
+rrdcached:      running
+npcd:           running
+naemon:         running
+apache:         running
+crontab:        running
+-----------------------
+Overall state:  running
+```
+
+- PASS: site data on host volume (etc/var/local/version + init-complete marker, root probe)
+- PASS: 5 site daemons run as user mysite
+- PASS: HTTPS /mysite/ through the edge (host-side)
+```
+302
+```
+
+- site-start ready-time (first start): see 'readiness' evidence above; formal median-of-5 baseline = T034 (FR-018)
+- PASS: restart same container reaches ready again
+```
+omd-s2
+ready-time=3s
+```
+
+- PASS: log shows 'resumed existing site mysite' (no re-creation)
+- PASS: replacement container resumes (account absent in fresh image)
+```
+ready-time=3s
+```
+
+- PASS: replacement: 'resumed existing site mysite'
+- PASS: replacement: omd status mysite rc 0
+```
+rrdcached:      running
+npcd:           running
+naemon:         running
+apache:         running
+crontab:        running
+-----------------------
+Overall state:  running
+```
+
+- PASS: SC-002: concurrent site A ready (/s2siteA/ via published edge)
+```
+ready-time=6s
+```
+
+- PASS: SC-002: concurrent site B ready (gate active + /s2siteB/ on its own edge)
+```
+ready-time=6s
+```
+
+- PASS: SC-002: site A still serving WHILE B runs (no interference, both up)
+```
+302
+```
+
+- PASS: SC-002: omd status of BOTH sites rc 0 (independent site daemons)
+```
+A0
+B0
+```
+
+- PASS: SC-002: both volumes populated independently (root probe)
+- site-start reference ready-time: see readiness evidence above (formal median-of-5 = T034)
+## S11a-s11a-rocky
+- when: 2026-11-18 03:00:28
+- runtime: podman
+
+- **RESULT: PASS**
+
+- base image: local/omd-labs-systemd-vm-base-rocky:nightly (edge unit httpd, expect no-site HTTP 403)
+- PASS: base readiness within bound (gate active + 443 answers)
+```
+ready-time=3s rc=0
+```
+
+- PASS: omd-ready + httpd + sshd all active
+```
+ready=active edge=active ssh=active
+```
+
+- PASS: edge answers the EXACT no-site code (403) on 443
+```
+code=403
+```
+
+- PASS: ss (the ready-gate probe tool) is PRESENT - a named cause, not a silent 120 s deadline
+```
+ss at: /usr/sbin/ss
+```
+
+- PASS: the omd binary is ABSENT (OMD-less chassis)
+```
+omd absent (ok)
+```
+
+- PASS: sshd reachable from host on 18452
+- PASS: omd.service resolves to the omd-site alias
+```
+alias -> /usr/lib/systemd/system/omd-site.service
+```
+
+- PASS: both labs.consol.de channels configured (stable + testing)
+- PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- teardown done

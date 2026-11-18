@@ -139,7 +139,12 @@ fx_golden() { # fx_golden <distro> <site>
     fx_root_reset "$gd"
     local gname="golden-omdcreate-$site"
     $RUNTIME rm -f "$gname" >/dev/null 2>&1 || true
-    $RUNTIME run -d --name "$gname" $(v_suite_label) \
+    # $(v_flags) is REQUIRED here: the golden boots the FULL entry (systemd
+    # as PID 1) and the entry's /sys/fs/cgroup writability check refuses an
+    # unprivileged start (EMPIRICAL 2026-11-17: S12 first run). The probe-only
+    # runs (v_vol_probe, fx_copy_tree, fx_omd_gid) legitimately omit the
+    # flags - they never boot systemd.
+    $RUNTIME run -d --name "$gname" $(v_flags) $(v_suite_label) \
         -e SITENAME="$site" \
         -v "$gd:/omd/sites/$site:z" -p 18461:443 "$IMAGE" >/dev/null
     # cleanup on ANY exit (kill+rm - a `podman stop` on a systemd-mid-boot

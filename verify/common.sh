@@ -80,6 +80,7 @@ v_port() { # v_port <scenario> [slot]
         s11a)  p=18451;;    # base no-site boot (reuse s1)
         s11ff) p=18451;;    # base + SITENAME fail-fast (reuse s1, separate run)
         s11b)  p=18457;;    # base runtime-install smoke (reuse s4)
+        s12)   p=18450;;    # OMD_ADMIN_PASSWORD credential scenario (fresh 18450)
         *) return 1;;
     esac
     (( p >= 18449 && p <= 18461 )) || { echo "v_port: $p out of range" >&2; return 1; }

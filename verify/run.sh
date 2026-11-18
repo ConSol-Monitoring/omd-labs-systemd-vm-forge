@@ -2,7 +2,7 @@
 # verify/run.sh - runner for the 001-systemd-vm-startup verification suite.
 #
 # Usage: verify/run.sh <scenario> [distro] [tag]
-#   scenario: s1 s2 s3 s3b s4 s5 s6 s7 s8 s9 s10
+#   scenario: s1 s2 s3 s3b s4 s5 s6 s7 s8 s9 s10 s11a s11b s12
 #   distro:   rocky (default) | debian
 #   tag:      image tag (default: branch-derived, master -> nightly)
 #
