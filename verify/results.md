@@ -12163,3 +12163,259 @@ alias -> /usr/lib/systemd/system/omd-site.service
 - PASS: both labs.consol.de channels configured (stable + testing)
 - PASS: clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
 - teardown done
+## S12-s12-debian
+- when: 2026-11-19 15:01:47
+- runtime: podman
+
+- **RESULT: PASS**
+
+- port 18450; site s12; volume /tmp/omd-verify/s12-site
+- --- (a) fresh + pw
+- PASS: (a) readiness (gate active + /s12/ answers 302/200)
+```
+ready-time=5s
+```
+
+- PASS: (a) htpasswd at EXACTLY etc/htpasswd, owned by the allocated site user (non-root, root probe)
+- PASS: (a) omdadmin entry present (root probe)
+- PASS: (a) thruk: authenticated 200 / anonymous 302
+```
+with-cred=200 anon=302
+```
+
+- PASS: (a) wrong password rejected (anon-equivalent 302, NOT 200)
+```
+wrong=302
+```
+
+- PASS: (a) notice line present exactly once (deterministic, no value)
+- PASS: (a) the literal password ABSENT from the container log (hardened: read must succeed and capture the entry's own output)
+- (a) stopped before (b) (code=130, stop rc=0)
+- --- (b) verbatim
+- PASS: (b) readiness
+```
+ready-time=5s
+```
+
+- PASS: (b) login with the EXACT verbatim value succeeds (leading/trailing space + metacharacters)
+```
+exact=200
+```
+
+- PASS: (b) the TRIMMED variant FAILS (302 - proves no trimming / no shell-evaluated string)
+```
+trimmed=302
+```
+
+- PASS: (b) notice present; the verbatim value ABSENT from the log
+- --- (c) replacement, stored wins (fresh container on the (a) volume)
+- PASS: (c) readiness (resume, gate active + /s12/)
+```
+ready-time=4s
+```
+
+- PASS: (c) log shows 'resumed existing site s12' (row 2, no re-creation)
+- PASS: (c) NO notice (the variable is a creation-only input, ignored on resume; hardened read)
+- PASS: (c) the STORED credential logs in (the (a) value, extracted before the run)
+```
+stored=200
+```
+
+- PASS: (c) the NEW value is REJECTED (stored wins, 302)
+```
+new=302
+```
+
+- PASS: (c) htpasswd content UNCHANGED (sha256 before == after, root probe)
+- (c) stored omdadmin hash: omdadmin:$apr1$.54.Cmr3$hkbReAmon7pKmtvm...
+- --- (e) clean stop contract
+- PASS: (e) clean stop -t 30 ends 130/0, not 137 (exit code: 130, stop rc: 0)
+- --- (d) empty value = no-op
+- PASS: (d) readiness
+```
+ready-time=5s
+```
+
+- PASS: (d) NO notice (the exactly-empty value is a no-op, no setter invocation; hardened read)
+- PASS: (d) the credential step was NEVER INVOKED (the run_bounded step line is absent; hardened read)
+- PASS: (d) the generated omdadmin entry stands in etc/htpasswd (root probe)
+- PASS: (d) 'created new site s12' (fresh creation, no credential step)
+- --- (i) recovery, tree-only (create --reuse branch)
+- PASS: (i) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=6s
+```
+
+- PASS: (i) recovery banner present
+```
+2026-11-19T14:02:37+00:00 cbe4200c430f systemd[1]: Started systemd-timedated.service - Time & Date Service.
+2026-11-19T14:02:37+00:00 cbe4200c430f dbus-daemon[930]: [system] Successfully activated service 'org.freedesktop.timedate1'
+2026-11-19T14:02:38+00:00 cbe4200c430f systemd[1]: Started exim4.service - exim Mail Transport Agent.
+2026-11-19T14:02:38+00:00 cbe4200c430f omd-ready-check[1234]: READY: base services up (omd-site active, apache2 443, sshd 22)
+2026-11-19T14:02:38+00:00 cbe4200c430f systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-19T14:02:38+00:00 cbe4200c430f systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-19T14:02:38+00:00 cbe4200c430f systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-19T14:02:38+00:00 cbe4200c430f systemd[1]: Startup finished in 2.535s.
+```
+
+- PASS: (i) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- PASS: (i) notice present (the creation tail was re-run)
+- PASS: (i) committed: complete marker present, in-progress gone (root probe)
+- --- (ii) recovery, version-link (omd enable branch, old credential invalidated)
+- PASS: (ii) pre-state: the KNOWN old credential is seeded (root probe)
+- PASS: (ii) readiness
+```
+ready-time=4s
+```
+
+- PASS: (ii) recovery banner + the version-link re-registration line
+```
+2026-11-19T14:03:03+00:00 c05cf78b71c6 /etc/mysql/debian-start[759]: Checking for insecure root accounts.
+2026-11-19T14:03:03+00:00 c05cf78b71c6 systemd[1]: Started exim4.service - exim Mail Transport Agent.
+2026-11-19T14:03:03+00:00 c05cf78b71c6 systemd[1]: Reached target multi-user.target - Multi-User System.
+2026-11-19T14:03:03+00:00 c05cf78b71c6 systemd[1]: Reached target graphical.target - Graphical Interface.
+2026-11-19T14:03:03+00:00 c05cf78b71c6 systemd[1]: Started systemd-timedated.service - Time & Date Service.
+2026-11-19T14:03:03+00:00 c05cf78b71c6 systemd[1]: Startup finished in 3.574s.
+2026-11-19T14:03:03+00:00 c05cf78b71c6 dbus-daemon[129]: [system] Successfully activated service 'org.freedesktop.timedate1'
+2026-11-19T14:03:03+00:00 c05cf78b71c6 /etc/mysql/debian-start[766]: Triggering myisam-recover for all MyISAM tables and aria-recover for all Aria tables
+```
+
+- PASS: (ii) login with the environment value succeeds
+```
+with-cred=200
+```
+
+- PASS: (ii) the SEEDING credential is now REJECTED: the pre-existing generated credential is INVALIDATED (old-pw login 302; the env value logs in - primary oracle)
+```
+old-pw=302
+```
+
+- PASS: (ii) the htpasswd entry was REPLACED (new non-empty, different from the SEEDING entry, root probe)
+- PASS: (ii) anonymous access stays 302 (no anonymous bypass introduced)
+```
+anon=302
+```
+
+- PASS: (ii) notice present
+- --- (iii) persisted (stale INPROG), stored wins
+- PASS: (iii) readiness (resume, not recovery)
+```
+ready-time=3s
+```
+
+- PASS: (iii) log shows 'resumed existing site s12' (persisted row, not re-creation)
+- PASS: (iii) stale in-progress marker REMOVED (root probe)
+- PASS: (iii) NO notice (no creation tail ran; hardened read)
+- PASS: (iii) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iii) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iii) htpasswd UNCHANGED (sha256, root probe)
+- --- (iv) adopted legacy, stored wins
+- PASS: (iv) readiness (adopt path starts the site)
+```
+ready-time=4s
+```
+
+- PASS: (iv) prominent 'adopted existing site' banner
+```
+2026-11-19T14:03:35+00:00 65d0139ae056 systemd[1]: Finished omd-site.service - OMD labs single active site (start/stop).
+2026-11-19T14:03:35+00:00 65d0139ae056 systemd[1]: Starting omd-ready.service - OMD labs bounded readiness gate (FR-018)...
+2026-11-19T14:03:35+00:00 65d0139ae056 sshd-session[686]: Connection closed by 127.0.0.1 port 49756
+2026-11-19T14:03:36+00:00 65d0139ae056 crontab[717]: (s12) LIST (s12)
+2026-11-19T14:03:36+00:00 65d0139ae056 omd-ready-check[507]: READY: base services up (omd-site active, apache2 443, sshd 22)
+2026-11-19T14:03:36+00:00 65d0139ae056 systemd[1]: Finished omd-ready.service - OMD labs bounded readiness gate (FR-018).
+2026-11-19T14:03:36+00:00 65d0139ae056 dbus-daemon[129]: [system] Activating via systemd: service name='org.freedesktop.timedate1' unit='dbus-org.freedesktop.timedate1.service' requested by ':1.2' (uid=1234 pid=740 comm="timedatectl" label="unconfined_u:unconfined_r:spc_t:s0")
+2026-11-19T14:03:36+00:00 65d0139ae056 systemd[1]: Starting systemd-timedated.service - Time & Date Service...
+```
+
+- PASS: (iv) NO notice (the credential step is absent from adopt_site; hardened read)
+- PASS: (iv) the STORED credential logs in
+```
+stored=200
+```
+
+- PASS: (iv) the NEW value is REJECTED (302)
+```
+new=302
+```
+
+- PASS: (iv) htpasswd UNCHANGED (sha256, root probe)
+- --- (j) fresh tail: injected failure at the credential step
+- PASS: (j) failure at the fresh credential step ? exit 1 (code=1)
+- PASS: (j) the injected line was REACHED (sentinel present, cp from stopped container)
+- PASS: (j) the credential step had SUCCEEDED before the injection (notice present, value NOT in it)
+- PASS: (j) the password value ABSENT from entry-fatal AND the container log (hardened: fresh copy, cp+read must succeed)
+- PASS: (j) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (j) INPROG marker RETAINED (retry re-enters the creation lifecycle, root probe)
+- (j) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- PASS: (j) retry completes: ready (gate + /s12/)
+```
+ready-time=4s
+```
+
+- PASS: (j) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (j) retry committed: complete marker + in-progress gone (root probe)
+- --- (k) recovery tail: injected failure at the credential step
+- PASS: (k) failure at the recovery credential step ? exit 1 (code=1)
+- PASS: (k) the injected line was REACHED (sentinel present, cp from stopped container)
+- PASS: (k) the credential step had SUCCEEDED before the injection (notice present, value NOT in it)
+- PASS: (k) the password value ABSENT from entry-fatal AND the container log (hardened: fresh copy, cp+read must succeed)
+- PASS: (k) COMPLETE marker ABSENT (the recovery never committed, root probe)
+- PASS: (k) INPROG marker RETAINED (root probe)
+- (k) no site service could be up: the entry fatals PRE-init - the named cause IS the proof nothing was started
+- PASS: (k) retry completes: ready (gate + /s12/)
+```
+ready-time=3s
+```
+
+- PASS: (k) retry: login with the value succeeds
+```
+with-cred=200
+```
+
+- PASS: (k) retry committed: complete marker + in-progress gone (root probe)
+- --- (l) fresh tail: the REAL tool fails (rc=99) - production run_bounded/fatal
+- PASS: (l) the real tool failure -> exit 1 (code=1)
+- PASS: (l) the credential step WAS invoked (the real run_bounded step line present, hardened read)
+- PASS: (l) the success notice is ABSENT (the setter did not succeed; hardened read)
+- PASS: (l) the value is ABSENT from entry-fatal AND the container log (non-disclosure on the real failure path; fresh copy, cp+read must succeed)
+- PASS: (l) the fault body EXECUTED (the volume mark the injected line wrote, root probe)
+- PASS: (l) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (l) INPROG marker RETAINED (the next boot re-enters the lifecycle, root probe)
+- (l) no site service could be up: the entry fatals PRE-init (before exec /sbin/init) - the named cause IS the proof nothing was started
+- --- (m) fresh tail: the REAL tool TIMES OUT (45s > the 30s bound)
+- PASS: (m) the real tool timeout -> exit 1 (code=1)
+- PASS: (m) entry-fatal carries the TIMEOUT rc (124 or 137) for the named step (fresh copy, cp+read must succeed)
+- PASS: (m) the credential step WAS invoked (the real run_bounded step line present, hardened read)
+- PASS: (m) the value is ABSENT from entry-fatal AND the container log (fresh copy, cp+read must succeed)
+- PASS: (m) COMPLETE marker ABSENT (the commit never ran, root probe)
+- PASS: (m) INPROG marker RETAINED (root probe)
+- --- (n) retry after the real (l) failure: the normal image completes the creation
+- PASS: (n) readiness (recovery completes, gate active + /s12/)
+```
+ready-time=4s
+```
+
+- PASS: (n) the value is now the effective credential (login 200)
+```
+with-cred=200
+```
+
+- PASS: (n) notice present exactly once (the creation tail ran, hardened read)
+- PASS: (n) committed: complete marker present, in-progress gone (root probe)
+- sub-items (a)-(e), (i)-(iv), (j), (k), (l), (m), (n) done
