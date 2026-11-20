@@ -1,18 +1,20 @@
-# OMD Labs: a small Linux lab in a container
+# VM-like containers for Docker and Podman
 
 Run an [OMD Labs](https://omd.consol.de/docs/omd/) monitoring site, test a
 plugin, or try a Linux service without setting up a virtual machine.
 These images run **systemd as PID 1**, so familiar commands such as
 `systemctl`, `journalctl`, and `omd` work inside a Docker or Podman container.
 
-There are two flavors, each available for **Rocky Linux 10** and **Debian 13**:
+There are two image variants, each available for **Rocky Linux 10** and **Debian 13**:
 
-- **OMD image** — the base environment with OMD Labs already installed.
-  Choose a site name when you start it; the container creates and starts
-  the site for you. This is the easiest place to begin.
-- **Base image** — Linux with systemd, Apache, SSH, cron, and the ConSol
-  package repositories, without OMD. Use it to test services or build an
-  environment with your own choice of OMD version.
+- **Base image** — Linux with systemd, Apache, SSH, and cron, without an
+  OMD package. The stable and testing repositories at `labs.consol.de` are
+  already configured. Use it to test services or install your chosen OMD version.
+- **OMD image** — the base image with **OMD Labs Edition** installed.
+  OMD Labs is ConSol's flavor of the Open Monitoring Distribution (OMD).
+  Choose a site name when you start the container; it creates and starts
+  the site for you. Start here if you want to try OMD or test against a
+  running monitoring site.
 
 For OMD developers, this means a disposable place to test against a real
 site. For administrators, it means a demo you can open in a browser and
@@ -226,7 +228,7 @@ publishing its port are separate choices; `EXPOSE` alone does neither.
 
 ## Use the base image
 
-For a Linux service lab without OMD, choose the base flavor. Apache, SSH,
+For a Linux service lab without OMD, choose the base image. Apache, SSH,
 and cron are already managed by systemd; the stable and testing ConSol
 repositories are configured for later package installation.
 
@@ -724,7 +726,7 @@ Images are published to **GHCR** under
 arm64. `latest` and `nightly` move; version tags such as `v5.80` are
 immutable. Architecture-specific tags use `-amd64` and `-arm64` suffixes.
 
-The [workflows](.github/workflows/) publish both flavors on OMD publication
+The [workflows](.github/workflows/) publish both image variants on OMD publication
 webhooks or release tags. The OMD image inherits the base from the same
 checkout/build, rather than pulling an independently published base.
 Refreshing a base tag later does not update existing full-image layers.
