@@ -1,9 +1,9 @@
-# VM-like containers for Docker and Podman
+# VM-like containers for Podman and Docker
 
 Run an [OMD Labs](https://omd.consol.de/docs/omd/) monitoring site, test a
 plugin, or try a Linux service without setting up a virtual machine.
 These images run **systemd as PID 1**, so familiar commands such as
-`systemctl`, `journalctl`, and `omd` work inside a Docker or Podman container.
+`systemctl`, `journalctl`, and `omd` work inside a Podman or Docker container.
 
 There are two image variants, each available for **Rocky Linux 10** and **Debian 13**:
 
@@ -34,12 +34,14 @@ model exposed by a host VM).
 
 ## Try a demo
 
-The examples use Bash and Docker. **For Podman, replace `docker` with
-`podman` and add `--systemd=always` to every `podman run`.** Both engines
-need `--privileged`. Keep using the same engine and user throughout;
-Docker, Podman, and `sudo podman` have separate image and container stores.
-The execution records cover Podman; the Docker commands have not yet been
-run on our test host.
+The examples use **Bash and Podman**, with `--privileged` and
+`--systemd=always` for service containers. Keep using the same Podman user
+throughout: `podman` and `sudo podman` have separate image and container stores.
+
+**For Docker**, replace `podman` with `docker` and omit `--systemd=always`.
+If you use the readiness helper below, set `CONTAINER_RUNTIME=docker` too.
+Docker has its own image store. The execution records cover Podman; Docker
+commands have not yet been run on our test host.
 
 Choose an image. `latest` follows stable OMD; use `nightly` to try the
 current development build. Replace the final `rocky` with `debian` if you
@@ -47,16 +49,7 @@ prefer Debian.
 
 ```bash
 IMAGE=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-rocky:latest
-docker pull "$IMAGE"
-docker run --name omd-demo --privileged -d \
-  -p 127.0.0.1:8443:443 \
-  -e SITENAME=demo \
-  "$IMAGE"
-```
-
-With Podman, the run command is:
-
-```bash
+podman pull "$IMAGE"
 podman run --name omd-demo --privileged --systemd=always -d \
   -p 127.0.0.1:8443:443 \
   -e SITENAME=demo \
@@ -66,8 +59,8 @@ podman run --name omd-demo --privileged --systemd=always -d \
 Give the site a moment to start, then check:
 
 ```bash
-docker exec omd-demo systemctl is-active omd-ready
-docker exec omd-demo omd status demo
+podman exec omd-demo systemctl is-active omd-ready
+podman exec omd-demo omd status demo
 ```
 
 Wait for the first command to print **`active`**, then expect OMD to report
@@ -78,7 +71,7 @@ For scripts, use the [bounded readiness helper](#wait-for-startup-in-scripts).
 Set a web password:
 
 ```bash
-docker exec -it omd-demo su - demo -c set_admin_password
+podman exec -it omd-demo su - demo -c set_admin_password
 ```
 
 To set the password during initial site creation instead, add
@@ -94,14 +87,14 @@ configure access and trusted TLS for your deployment.
 You now have a working monitoring site. Open a shell to explore it:
 
 ```bash
-docker exec -it omd-demo bash
+podman exec -it omd-demo bash
 ```
 
 When finished:
 
 ```bash
-docker stop -t 30 omd-demo
-docker rm omd-demo
+podman stop -t 30 omd-demo
+podman rm omd-demo
 ```
 
 This demo stores its site in the container: stopping keeps it, removing
@@ -116,7 +109,7 @@ Here is a separate site on port 8444:
 ```bash
 DATA_ROOT="$HOME/omd-labs-data"
 mkdir -p "$DATA_ROOT/lab"
-docker run --name omd-lab --privileged -d \
+podman run --name omd-lab --privileged --systemd=always -d \
   -p 127.0.0.1:8444:443 \
   -e SITENAME=lab \
   -v "$DATA_ROOT/lab:/omd/sites/lab:z" \
@@ -124,7 +117,7 @@ docker run --name omd-lab --privileged -d \
 ```
 
 Check `omd-ready` as above, set the password with
-`docker exec -it omd-lab su - lab -c set_admin_password`, and visit
+`podman exec -it omd-lab su - lab -c set_admin_password`, and visit
 **https://127.0.0.1:8444/lab/**.
 
 An empty directory becomes a new site. A complete existing site is resumed
@@ -143,17 +136,17 @@ A named volume is another option: replace the bind mount with
 A stop/start cycle keeps the same container:
 
 ```bash
-docker stop -t 30 omd-lab
-docker start omd-lab
+podman stop -t 30 omd-lab
+podman start omd-lab
 ```
 
 To replace it, stop and remove the old container, then run a new one with
 the **same image, site name, and data directory**:
 
 ```bash
-docker stop -t 30 omd-lab
-docker rm omd-lab
-docker run --name omd-lab --privileged -d \
+podman stop -t 30 omd-lab
+podman rm omd-lab
+podman run --name omd-lab --privileged --systemd=always -d \
   -p 127.0.0.1:8444:443 \
   -e SITENAME=lab \
   -v "$DATA_ROOT/lab:/omd/sites/lab:z" \
@@ -178,19 +171,19 @@ touching your own monitoring installation. This example creates a test
 site, then copies a plugin from your current directory into it:
 
 ```bash
-docker run --name omd-test --privileged -d \
+podman run --name omd-test --privileged --systemd=always -d \
   -e SITENAME=test \
   "$IMAGE"
 # Wait for omd-ready to become active before the next commands.
-docker exec omd-test systemctl is-active omd-ready
+podman exec omd-test systemctl is-active omd-ready
 ```
 
 Repeat the check until it prints `active`, then copy and run your plugin:
 
 ```bash
-docker cp ./check_example omd-test:/omd/sites/test/local/lib/monitoring-plugins/check_example
-docker exec omd-test chmod 755 /omd/sites/test/local/lib/monitoring-plugins/check_example
-docker exec omd-test su - test -c 'local/lib/monitoring-plugins/check_example --help'
+podman cp ./check_example omd-test:/omd/sites/test/local/lib/monitoring-plugins/check_example
+podman exec omd-test chmod 755 /omd/sites/test/local/lib/monitoring-plugins/check_example
+podman exec omd-test su - test -c 'local/lib/monitoring-plugins/check_example --help'
 ```
 
 Substitute your own plugin and arguments. Running it as the site user
@@ -204,8 +197,8 @@ site. If your code requires extra packages, install them in a derived
 image so the test environment can be rebuilt.
 
 ```bash
-docker stop -t 30 omd-test
-docker rm omd-test
+podman stop -t 30 omd-test
+podman rm omd-test
 ```
 
 ### Try a component: Gearman
@@ -215,15 +208,15 @@ this new site enables the Gearman integration and makes its listener
 available to programs on your host:
 
 ```bash
-docker run --name omd-gearman --privileged -d \
+podman run --name omd-gearman --privileged --systemd=always -d \
   -p 127.0.0.1:4730:4730 \
   -e SITENAME=gearman \
   -e OMDCFG_MOD_GEARMAN=on \
   -e OMDCFG_GEARMAND_PORT=0.0.0.0:4730 \
   "$IMAGE"
 # After readiness:
-docker exec omd-gearman runuser -u gearman -- omd config show MOD_GEARMAN
-docker exec omd-gearman ss -ltn
+podman exec omd-gearman runuser -u gearman -- omd config show MOD_GEARMAN
+podman exec omd-gearman ss -ltn
 ```
 
 Expect `on` and a listener on port 4730. This uses OMD's default
@@ -238,10 +231,10 @@ repositories are configured for later package installation.
 
 ```bash
 BASE_IMAGE=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-base-rocky:latest
-docker run --name linux-lab --privileged -d "$BASE_IMAGE"
-docker exec linux-lab systemctl is-active omd-ready
+podman run --name linux-lab --privileged --systemd=always -d "$BASE_IMAGE"
+podman exec linux-lab systemctl is-active omd-ready
 # Once active:
-docker exec -it linux-lab bash
+podman exec -it linux-lab bash
 ```
 
 Inside the container, work as you would in a small Linux installation:
@@ -301,7 +294,7 @@ cat > site-settings.conf <<'SETTINGS'
 ADMIN_MAIL=monitoring@example.org
 SETTINGS
 
-docker run --name omd-custom --privileged -d \
+podman run --name omd-custom --privileged --systemd=always -d \
   -p 127.0.0.1:8446:443 \
   -e SITENAME=custom \
   -e OMDCFG_ADMIN_MAIL=lab@example.org \
@@ -317,8 +310,8 @@ Available keys and values depend on the installed OMD version. Inspect the
 actual site's settings rather than relying on a fixed catalog:
 
 ```bash
-docker exec omd-custom runuser -u custom -- omd config show
-docker exec omd-custom runuser -u custom -- omd config show ADMIN_MAIL
+podman exec omd-custom runuser -u custom -- omd config show
+podman exec omd-custom runuser -u custom -- omd config show ADMIN_MAIL
 ```
 
 ### Change an existing site deliberately
@@ -331,14 +324,14 @@ inputs; malformed settings-file syntax can still fail validation.
 To change a stored setting, stop the site, apply it, then start it again:
 
 ```bash
-docker exec omd-lab systemctl stop omd
-docker exec omd-lab runuser -u lab -- omd config set ADMIN_MAIL new-address@example.org
-docker exec omd-lab systemctl start omd
-docker exec omd-lab runuser -u lab -- omd config show ADMIN_MAIL
-docker exec omd-lab omd status lab
+podman exec omd-lab systemctl stop omd
+podman exec omd-lab runuser -u lab -- omd config set ADMIN_MAIL new-address@example.org
+podman exec omd-lab systemctl start omd
+podman exec omd-lab runuser -u lab -- omd config show ADMIN_MAIL
+podman exec omd-lab omd status lab
 ```
 
-`docker restart` does not change a container's environment or mounts. To
+`podman restart` does not change a container's environment or mounts. To
 change those, create a replacement container; to try different *initial*
 site settings, use a new site directory or volume.
 
@@ -347,10 +340,10 @@ site settings, use a new site directory or volume.
 Use the same tools you would use in an OMD VM:
 
 ```bash
-docker exec omd-lab systemctl status omd
-docker exec omd-lab systemctl restart omd
-docker exec omd-lab journalctl -u omd-site --no-pager -n 40
-docker exec omd-lab omd status lab
+podman exec omd-lab systemctl status omd
+podman exec omd-lab systemctl restart omd
+podman exec omd-lab journalctl -u omd-site --no-pager -n 40
+podman exec omd-lab omd status lab
 ```
 
 `omd` is an alias of `omd-site.service`. Its **`active (exited)`** state is
@@ -363,21 +356,21 @@ backend. Rocky uses unit names `httpd`, `sshd`, and `crond`; Debian uses
 `apache2`, `ssh`, and `cron`. If a service fails after startup, the container
 stays up so you can inspect and restart it.
 
-Stop the whole environment with `docker stop -t 30 NAME` (or
-`podman stop -t 30 NAME`). This gives systemd time to stop the services in
-order. A clean halt may return container exit code **0 or 130**; **137**
+Stop the whole environment with `podman stop -t 30 NAME`. This gives systemd
+time to stop the services in order. A clean halt may return container exit
+code **0 or 130**; **137**
 means it was killed, for example after the stop timeout.
 
 ### Add SSH access
 
-For most tasks, `docker exec` is enough. If you want SSH, mount your
+For most tasks, `podman exec` is enough. If you want SSH, mount your
 **public** key and publish port 22. This separate example starts without
 a monitoring site:
 
 ```bash
 # Use an existing public key, or generate a dedicated pair once:
 [ -f ./omd-lab-key ] || ssh-keygen -t ed25519 -f ./omd-lab-key -N ''
-docker run --name omd-ssh --privileged -d \
+podman run --name omd-ssh --privileged --systemd=always -d \
   -p 127.0.0.1:18022:22 \
   -v "$PWD/omd-lab-key.pub:/root/.ssh/omd_ssh_keys:ro,z" \
   "$IMAGE"
@@ -408,7 +401,7 @@ Define once and call after each `run` or `start`. The 360-second bound
 allows for all startup phases; runtime commands must remain responsive.
 
 ```bash
-CONTAINER_RUNTIME=docker  # or podman
+CONTAINER_RUNTIME=podman  # set to docker when using Docker
 wait_ready() {
     local name=$1 running state started=$SECONDS
     while (( SECONDS - started < 360 )); do
@@ -443,8 +436,8 @@ additional ones yourself, as in the Gearman example.
 Start with the container logs and exit status:
 
 ```bash
-docker logs --tail 60 omd-lab
-docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' omd-lab
+podman logs --tail 60 omd-lab
+podman inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' omd-lab
 ```
 
 Common causes are a missing Podman systemd flag, insufficient privileges,
@@ -458,7 +451,7 @@ fresh directory:
 ```bash
 DIAG=$(mktemp -d)
 for file in entry-fatal fatal-reason; do
-    if docker cp "omd-lab:/var/log/omd-labs/$file" "$DIAG/$file" 2>/dev/null; then
+    if podman cp "omd-lab:/var/log/omd-labs/$file" "$DIAG/$file" 2>/dev/null; then
         cat "$DIAG/$file"
     fi
 done
@@ -474,13 +467,13 @@ OMD can mount the site's `tmp/` directory as tmpfs. For a fresh site, enable
 it with **`OMDCFG_TMPFS=on`**:
 
 ```bash
-docker run --name omd-ram --privileged -d \
+podman run --name omd-ram --privileged --systemd=always -d \
   -e SITENAME=ramdemo -e OMDCFG_TMPFS=on \
   -v omd-ram-data:/omd/sites/ramdemo \
   "$IMAGE"
 # After readiness:
-docker exec omd-ram runuser -u ramdemo -- omd config show TMPFS
-docker exec omd-ram findmnt -T /omd/sites/ramdemo/tmp -o TARGET,FSTYPE,OPTIONS
+podman exec omd-ram runuser -u ramdemo -- omd config show TMPFS
+podman exec omd-ram findmnt -T /omd/sites/ramdemo/tmp -o TARGET,FSTYPE,OPTIONS
 ```
 
 Expect `on` and filesystem type `tmpfs`. The mount may appear under
@@ -505,9 +498,9 @@ other optional examples you started:
 
 ```bash
 for name in omd-gearman omd-custom omd-ssh linux-lab omd-ram; do
-    if docker container inspect "$name" >/dev/null 2>&1; then
-        docker stop -t 30 "$name"
-        docker rm "$name"
+    if podman container inspect "$name" >/dev/null 2>&1; then
+        podman stop -t 30 "$name"
+        podman rm "$name"
     fi
 done
 ```
@@ -521,13 +514,13 @@ Clone this repository and run from its root. The default Dockerfile target
 builds the full OMD image:
 
 ```bash
-docker build -f Dockerfile.omd-labs-systemd-vm-rocky \
+podman build -f Dockerfile.omd-labs-systemd-vm-rocky \
   --build-arg OMD_VERSION=master \
   -t local/omd-labs-systemd-vm-rocky:nightly .
 IMAGE=local/omd-labs-systemd-vm-rocky:nightly
 ```
 
-Use the Debian Dockerfile for Debian, or `podman build` for Podman.
+Use the Debian Dockerfile for Debian.
 `OMD_VERSION=master` selects the daily/testing package; `latest` selects
 stable; a release such as `5.80` selects its versioned stable package.
 Only even minor versions are stable releases; odd minors are reached
@@ -536,21 +529,23 @@ through the nightly track. The image tag itself does not choose a package.
 To build the base without OMD:
 
 ```bash
-docker build -f Dockerfile.omd-labs-systemd-vm-rocky --target base \
+podman build -f Dockerfile.omd-labs-systemd-vm-rocky --target base \
   -t local/omd-labs-systemd-vm-base-rocky:nightly .
 ```
 
-The Makefiles offer `build`, `start`, `startvol`, and `stop`. For example:
+After the Podman build above, you can also start and stop the local image
+with the Makefile:
 
 ```bash
-make -f Makefile.omd-labs-systemd-vm-rocky build
 make -f Makefile.omd-labs-systemd-vm-rocky start RUNTIME=podman SITENAME=demo
 make -f Makefile.omd-labs-systemd-vm-rocky stop RUNTIME=podman SITENAME=demo
 ```
 
-Use the same engine's image store: `build` always calls Docker, even with
-`RUNTIME=podman`; build directly with Podman before using its runtime
-targets. Make derives the local tag from the branch (`master` → `nightly`).
+Pass `RUNTIME=podman` to Make's `start`, `startvol`, and `stop` targets;
+their default is Docker. The Make `build` target always calls Docker, even
+with `RUNTIME=podman`, so use `podman build` as shown above on a Podman host.
+Make derives the local tag from the branch (`master` → `nightly`); use the
+matching local tag when building for these targets.
 `FLAVOR=base` selects the base build. `startvol` requires an existing
 absolute `VOLUME` directory and the matching `SITENAME`. Full-image Make
 runs default to `SITENAME=demo`, unlike direct runs, which default to no
@@ -716,7 +711,7 @@ the mounted site remains durable.
 
 OMD normally defaults TMPFS off in containers. Privileged Podman testing
 confirmed it can be enabled on these images. A separate runtime
-`--tmpfs /scratch:...` mount is created by Docker/Podman instead and has no
+`--tmpfs /scratch:...` mount is created by Podman/Docker instead and has no
 connection to OMD's setting. Mount permissions depend on the host and user
 namespace; consult the [verification records](verify/results.md) for the
 executed cases.
