@@ -81,6 +81,10 @@ Set a web password:
 docker exec -it omd-demo su - demo -c set_admin_password
 ```
 
+To set the password during initial site creation instead, add
+`-e OMD_ADMIN_PASSWORD='your-lab-password'` to the run command. See
+[Configure OMD](#configure-omd) for details.
+
 Open **https://127.0.0.1:8443/demo/** and log in as **`omdadmin`** with that
 password. The image uses a test TLS certificate, so expect a browser
 certificate warning. The port mapping makes this demo available only on
