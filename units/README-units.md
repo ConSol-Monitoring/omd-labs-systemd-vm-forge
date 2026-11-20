@@ -62,4 +62,4 @@ this document is what the T012/T029 audits assert against.
   crash and is not a live health check (`omd status <site>` is).
 - **Existing containers built before 2026-11-13 keep the old mask**: the alias lands with
   a rebuilt image; migrating a live site means the documented replacement-container
-  rollout (TUTORIAL §5), not an in-place unmask.
+  rollout ([README: restart or replace](../README.md#restart-or-replace-the-container)), not an in-place unmask.
