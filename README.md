@@ -47,6 +47,9 @@ Choose an image. `latest` follows stable OMD; use `nightly` to try the
 current development build. Replace the final `rocky` with `debian` if you
 prefer Debian.
 
+Browse the [published container images](https://github.com/ConSol-Monitoring/omd-labs-systemd-vm-forge/packages)
+and select an image to see its available tags, architectures, and other metadata.
+
 ```bash
 IMAGE=ghcr.io/consol-monitoring/omd-labs-systemd-vm-forge/omd-labs-systemd-vm-rocky:latest
 podman pull "$IMAGE"
